@@ -95,14 +95,18 @@ class OptimizerParamScheduler:
         self.step(0)
         log_single_rank(logger, logging.INFO, f"> learning rate decay style: {self.lr_decay_style}")
 
-    def get_wd(self, param_group: dict) -> float:
+    def get_wd(self, param_group: Optional[dict] = None) -> float:
         """Weight decay incr functions
 
         Args:
             param_group (dict): parameter group from the optimizer."""
 
-        start_wd = param_group.get('start_wd', self.start_wd)
-        end_wd = param_group.get('end_wd', self.end_wd)
+        if param_group is not None:
+            start_wd = param_group.get('start_wd', self.start_wd)
+            end_wd = param_group.get('end_wd', self.end_wd)
+        else:
+            start_wd = self.start_wd
+            end_wd = self.end_wd
 
         if self.num_steps > self.wd_incr_steps:
             return end_wd
