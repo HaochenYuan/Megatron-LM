@@ -11,9 +11,50 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
-from .utils import GlobalMemoryBuffer, GlobalSymmetricMemoryBuffer, is_torch_min_version
+from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
+
+# PyNCCL support for AMEM NCCL memory offloading
+# Note: Use lazy import to avoid circular import issues
+HAVE_PYNCCL = None  # Will be set on first check
+_PyNCCLCommunicator = None  # Lazy loaded
+_NCCLLibrary = None  # Lazy loaded
+
+def _check_pynccl_available():
+    """Check if PyNCCL is available (lazy import to avoid circular imports)."""
+    global HAVE_PYNCCL, _PyNCCLCommunicator, _NCCLLibrary
+    
+    if HAVE_PYNCCL is not None:
+        return HAVE_PYNCCL
+    
+    try:
+        from megatron.core.distributed.device_communicators.pynccl import PyNCCLCommunicator
+        from megatron.core.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
+        _PyNCCLCommunicator = PyNCCLCommunicator
+        _NCCLLibrary = NCCLLibrary
+        HAVE_PYNCCL = True
+        logger.info("PyNCCL imported successfully")
+    except ImportError as e:
+        HAVE_PYNCCL = False
+        logger.debug(f"PyNCCL not available: {e}")
+    except Exception as e:
+        HAVE_PYNCCL = False
+        logger.warning(f"PyNCCL import failed: {e}")
+    
+    return HAVE_PYNCCL
+
+
+def _get_pynccl_communicator_class():
+    """Get PyNCCLCommunicator class (lazy import)."""
+    _check_pynccl_available()
+    return _PyNCCLCommunicator
+
+
+def _get_nccl_library_class():
+    """Get NCCLLibrary class (lazy import)."""
+    _check_pynccl_available()
+    return _NCCLLibrary
 
 try:
     import einops
@@ -99,10 +140,6 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # the first local rank in the tensor model parallel group
 _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = None
 
-# A list of global ranks for each expert model parallel group to ease calculation of
-# the first local rank in the expert model parallel group
-_EXPERT_MODEL_PARALLEL_RANKS = None
-
 # A list of global ranks for each model parallel group to ease calculation of
 # the first local rank in the model parallel group
 _MODEL_PARALLEL_GLOBAL_RANKS = None
@@ -136,13 +173,20 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# Global symmetric memory buffer for inference
-_GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
-
 # List of all process groups
 # Used for updating the timeout for all process groups
 # None represents the default process group
 _global_process_group_list = None
+
+# PyNCCL communicators for AMEM NCCL support
+# These are parallel to the standard PyTorch process groups
+_PYNCCL_TENSOR_MODEL_PARALLEL_COMM = None
+_PYNCCL_PIPELINE_MODEL_PARALLEL_COMM = None
+_PYNCCL_DATA_PARALLEL_COMM = None
+_PYNCCL_CONTEXT_PARALLEL_COMM = None
+_PYNCCL_EXPERT_MODEL_PARALLEL_COMM = None
+# Flag to indicate if PyNCCL is enabled
+_PYNCCL_ENABLED = False
 
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
@@ -537,6 +581,8 @@ def initialize_model_parallel(
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
+    enable_pynccl: bool = False,
+    pynccl_so_path: Optional[str] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -1124,7 +1170,7 @@ def initialize_model_parallel(
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
-    global _EXPERT_MODEL_PARALLEL_GROUP, _EXPERT_MODEL_PARALLEL_RANKS
+    global _EXPERT_MODEL_PARALLEL_GROUP
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in expert_decoder_rank_generator.get_ranks('ep'):
         group = create_group(
@@ -1135,7 +1181,6 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
-            _EXPERT_MODEL_PARALLEL_RANKS = ranks
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
@@ -1293,6 +1338,85 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    # Initialize PyNCCL communicators for AMEM NCCL support
+    global _PYNCCL_ENABLED
+    global _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
+    global _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM
+    global _PYNCCL_DATA_PARALLEL_COMM
+    global _PYNCCL_CONTEXT_PARALLEL_COMM
+    global _PYNCCL_EXPERT_MODEL_PARALLEL_COMM
+
+    if enable_pynccl:
+        # Use lazy import to avoid circular import issues
+        if not _check_pynccl_available():
+            logger.warning(
+                "PyNCCL requested but not available. "
+                "AMEM NCCL features will be disabled."
+            )
+        else:
+            try:
+                PyNCCLCommunicator = _get_pynccl_communicator_class()
+                NCCLLibrary = _get_nccl_library_class()
+                
+                _PYNCCL_ENABLED = True
+                
+                # Synchronize before initializing PyNCCL communicators
+                torch.distributed.barrier()
+                
+                # Helper function to safely create PyNCCL communicator
+                # Note: We only create PyNCCL communicator for TP group since 
+                # ncclCommInitRank is a collective operation that needs all ranks
+                def _safe_create_pynccl_comm(group, group_name):
+                    if group is None:
+                        logger.debug(f"Skipping PyNCCL for {group_name}: group is None")
+                        return None
+                    try:
+                        # Use Megatron's group.rank() to verify we're in this group
+                        local_rank = group.rank()
+                        world_size = group.size()
+                        logger.debug(f"Creating PyNCCL for {group_name}: "
+                                   f"rank={local_rank}, world_size={world_size}")
+                        
+                        # Create PyNCCL communicator with the torch group
+                        # This allows proper unique_id synchronization
+                        comm = PyNCCLCommunicator(
+                            group=group,
+                            nccl_so_path=pynccl_so_path,
+                        )
+                        comm.initialize()
+                        logger.debug(f"PyNCCL communicator created for {group_name}")
+                        return comm
+                    except Exception as e:
+                        logger.debug(f"Skipping PyNCCL for {group_name}: {e}")
+                        return None
+                
+                # Initialize PyNCCL only for tensor model parallel group
+                # This is the most commonly used group for AMEM NCCL
+                # Adding more groups would require careful synchronization
+                _PYNCCL_TENSOR_MODEL_PARALLEL_COMM = _safe_create_pynccl_comm(
+                    _TENSOR_MODEL_PARALLEL_GROUP, 
+                    "tensor_model_parallel"
+                )
+                
+                # Skip other groups for now to avoid collective operation issues
+                # Users can manually create PyNCCL communicators for other groups if needed
+                _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM = None
+                _PYNCCL_DATA_PARALLEL_COMM = None
+                _PYNCCL_CONTEXT_PARALLEL_COMM = None
+                _PYNCCL_EXPERT_MODEL_PARALLEL_COMM = None
+                
+                # Synchronize after PyNCCL initialization
+                torch.distributed.barrier()
+                
+                if rank == 0:
+                    nccl_lib = NCCLLibrary(pynccl_so_path)
+                    amem_status = "enabled" if nccl_lib.enable_amem_nccl else "disabled"
+                    print(f"> PyNCCL initialized, AMEM NCCL: {amem_status}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to initialize PyNCCL: {e}")
+                _PYNCCL_ENABLED = False
+
 
 def is_initialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -1334,6 +1458,130 @@ def get_tensor_model_parallel_group(check_initialized=True):
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), "tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP
+
+
+# === PyNCCL Communicator Access Functions ===
+
+def is_pynccl_enabled():
+    """Check if PyNCCL is enabled."""
+    return _PYNCCL_ENABLED
+
+
+def get_tensor_model_parallel_pynccl_comm():
+    """
+    Get the PyNCCL communicator for tensor model parallel group.
+    
+    Returns:
+        PyNCCLCommunicator: The PyNCCL communicator for TP group, or None if not enabled.
+        
+    Example:
+        >>> tp_pynccl = get_tensor_model_parallel_pynccl_comm()
+        >>> if tp_pynccl is not None and tp_pynccl.nccl.enable_amem_nccl:
+        ...     tp_pynccl.nccl_pause()  # Offload NCCL memory
+        ...     # ... do other work ...
+        ...     tp_pynccl.nccl_resume()  # Restore NCCL memory
+    """
+    if not _PYNCCL_ENABLED:
+        return None
+    return _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
+
+
+def get_pipeline_model_parallel_pynccl_comm():
+    """
+    Get the PyNCCL communicator for pipeline model parallel group.
+    
+    Returns:
+        PyNCCLCommunicator: The PyNCCL communicator for PP group, or None if not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        return None
+    return _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM
+
+
+def get_data_parallel_pynccl_comm():
+    """
+    Get the PyNCCL communicator for data parallel group.
+    
+    Returns:
+        PyNCCLCommunicator: The PyNCCL communicator for DP group, or None if not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        return None
+    return _PYNCCL_DATA_PARALLEL_COMM
+
+
+def get_context_parallel_pynccl_comm():
+    """
+    Get the PyNCCL communicator for context parallel group.
+    
+    Returns:
+        PyNCCLCommunicator: The PyNCCL communicator for CP group, or None if not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        return None
+    return _PYNCCL_CONTEXT_PARALLEL_COMM
+
+
+def get_expert_model_parallel_pynccl_comm():
+    """
+    Get the PyNCCL communicator for expert model parallel group.
+    
+    Returns:
+        PyNCCLCommunicator: The PyNCCL communicator for EP group, or None if not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        return None
+    return _PYNCCL_EXPERT_MODEL_PARALLEL_COMM
+
+
+def pynccl_pause_all():
+    """
+    Pause NCCL and offload ALL NCCL memory for ALL communication groups.
+    
+    AMEM NCCL's ncclPause(NULL) is a global operation that releases memory
+    for all NCCL communicators (TP, PP, DP, CP, EP) in the current process.
+    Only need to call once to free all NCCL memory.
+    
+    Raises:
+        RuntimeError: If AMEM NCCL is not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        logger.warning("PyNCCL is not enabled. Cannot pause.")
+        return
+    
+    # Use TP communicator to call global ncclPause
+    # ncclPause(NULL) releases memory for ALL NCCL comms in this process
+    comm = _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
+    if comm is not None and comm.nccl.enable_amem_nccl:
+        if not comm.is_paused:
+            comm.nccl_pause()
+    else:
+        logger.warning("No PyNCCL communicator available or AMEM NCCL not enabled")
+
+
+def pynccl_resume_all():
+    """
+    Resume NCCL and restore ALL NCCL memory for ALL communication groups.
+    
+    AMEM NCCL's ncclResume(NULL) is a global operation that restores memory
+    for all NCCL communicators (TP, PP, DP, CP, EP) in the current process.
+    Only need to call once to restore all NCCL memory.
+    
+    Raises:
+        RuntimeError: If AMEM NCCL is not enabled.
+    """
+    if not _PYNCCL_ENABLED:
+        logger.warning("PyNCCL is not enabled. Cannot resume.")
+        return
+    
+    # Use TP communicator to call global ncclResume
+    # ncclResume(NULL) restores memory for ALL NCCL comms in this process
+    comm = _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
+    if comm is not None and comm.nccl.enable_amem_nccl:
+        if comm.is_paused:
+            comm.nccl_resume()
+    else:
+        logger.warning("No PyNCCL communicator available or AMEM NCCL not enabled")
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
@@ -1731,15 +1979,6 @@ def get_expert_model_parallel_group(check_initialized=True):
     return _EXPERT_MODEL_PARALLEL_GROUP
 
 
-def get_expert_model_parallel_src_rank():
-    """Calculate the global rank corresponding to the first local rank
-    in the expert model parallel group."""
-    assert (
-        _EXPERT_MODEL_PARALLEL_RANKS is not None
-    ), "Expert model parallel group is not initialized"
-    return _EXPERT_MODEL_PARALLEL_RANKS[0]
-
-
 def get_expert_model_parallel_world_size():
     """Return world size for the expert-model-parallel group."""
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
@@ -1944,41 +2183,16 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
-def _set_global_symmetric_memory_buffer():
-    """Initialize global buffer."""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    assert _GLOBAL_SYMMETRIC_MEMORY_BUFFER is None, "global memory buffer is already initialized"
-
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = GlobalSymmetricMemoryBuffer(
-        size_in_mb=256,  # todo: set from an argument?
-        process_group=get_tensor_model_parallel_group(),
-    )
-
-
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
 
-def get_global_symmetric_memory_buffer():
-    """Return the global GlobalSymmetricMemoryBuffer object"""
-    assert (
-        _GLOBAL_SYMMETRIC_MEMORY_BUFFER is not None
-    ), "global symmetric memory buffer is not initialized"
-    return _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-
-
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
-
-
-def destroy_global_symmetric_memory_buffer():
-    """Sets the global symmetric memory buffer to None"""
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
 
 def get_all_ranks():
@@ -2055,9 +2269,6 @@ def destroy_model_parallel():
 
     global _GLOBAL_MEMORY_BUFFER
     _GLOBAL_MEMORY_BUFFER = None
-
-    global _GLOBAL_SYMMETRIC_MEMORY_BUFFER
-    _GLOBAL_SYMMETRIC_MEMORY_BUFFER = None
 
     global _DATA_PARALLEL_GROUP_GLOO
     if (
@@ -2141,3 +2352,33 @@ def destroy_model_parallel():
 
     global _global_process_group_list
     _global_process_group_list = None
+
+    # Destroy PyNCCL communicators
+    global _PYNCCL_ENABLED
+    global _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
+    global _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM
+    global _PYNCCL_DATA_PARALLEL_COMM
+    global _PYNCCL_CONTEXT_PARALLEL_COMM
+    global _PYNCCL_EXPERT_MODEL_PARALLEL_COMM
+
+    if _PYNCCL_TENSOR_MODEL_PARALLEL_COMM is not None:
+        _PYNCCL_TENSOR_MODEL_PARALLEL_COMM.destroy()
+    _PYNCCL_TENSOR_MODEL_PARALLEL_COMM = None
+
+    if _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM is not None:
+        _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM.destroy()
+    _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM = None
+
+    if _PYNCCL_DATA_PARALLEL_COMM is not None:
+        _PYNCCL_DATA_PARALLEL_COMM.destroy()
+    _PYNCCL_DATA_PARALLEL_COMM = None
+
+    if _PYNCCL_CONTEXT_PARALLEL_COMM is not None:
+        _PYNCCL_CONTEXT_PARALLEL_COMM.destroy()
+    _PYNCCL_CONTEXT_PARALLEL_COMM = None
+
+    if _PYNCCL_EXPERT_MODEL_PARALLEL_COMM is not None:
+        _PYNCCL_EXPERT_MODEL_PARALLEL_COMM.destroy()
+    _PYNCCL_EXPERT_MODEL_PARALLEL_COMM = None
+
+    _PYNCCL_ENABLED = False
