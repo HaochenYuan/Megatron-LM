@@ -1369,12 +1369,15 @@ def initialize_model_parallel(
                 def _safe_create_pynccl_comm(group, group_name):
                     if group is None:
                         logger.debug(f"Skipping PyNCCL for {group_name}: group is None")
+                        print(f"Skipping PyNCCL for {group_name}: group is None")
                         return None
                     try:
                         # Use Megatron's group.rank() to verify we're in this group
                         local_rank = group.rank()
                         world_size = group.size()
                         logger.debug(f"Creating PyNCCL for {group_name}: "
+                                   f"rank={local_rank}, world_size={world_size}")
+                        print(f"Creating PyNCCL for {group_name}: "
                                    f"rank={local_rank}, world_size={world_size}")
                         
                         # Create PyNCCL communicator with the torch group
@@ -1385,9 +1388,11 @@ def initialize_model_parallel(
                         )
                         comm.initialize()
                         logger.debug(f"PyNCCL communicator created for {group_name}")
+                        print(f"PyNCCL communicator created for {group_name}")
                         return comm
                     except Exception as e:
                         logger.debug(f"Skipping PyNCCL for {group_name}: {e}")
+                        print(f"Skipping PyNCCL for {group_name}: {e}")
                         return None
                 
                 # Initialize PyNCCL only for tensor model parallel group
@@ -1400,10 +1405,22 @@ def initialize_model_parallel(
                 
                 # Skip other groups for now to avoid collective operation issues
                 # Users can manually create PyNCCL communicators for other groups if needed
-                _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM = None
-                _PYNCCL_DATA_PARALLEL_COMM = None
-                _PYNCCL_CONTEXT_PARALLEL_COMM = None
-                _PYNCCL_EXPERT_MODEL_PARALLEL_COMM = None
+                _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM = _safe_create_pynccl_comm(
+                    _PIPELINE_MODEL_PARALLEL_GROUP, 
+                    "pipeline_model_parallel"
+                )
+                _PYNCCL_DATA_PARALLEL_COMM = _safe_create_pynccl_comm(
+                    _DATA_PARALLEL_GROUP, 
+                    "data_parallel"
+                )
+                _PYNCCL_CONTEXT_PARALLEL_COMM = _safe_create_pynccl_comm(
+                    _CONTEXT_PARALLEL_GROUP, 
+                    "context_parallel"
+                )
+                _PYNCCL_EXPERT_MODEL_PARALLEL_COMM = _safe_create_pynccl_comm(
+                    _EXPERT_MODEL_PARALLEL_GROUP, 
+                    "expert_model_parallel"
+                )
                 
                 # Synchronize after PyNCCL initialization
                 torch.distributed.barrier()
@@ -1551,12 +1568,21 @@ def pynccl_pause_all():
     
     # Use TP communicator to call global ncclPause
     # ncclPause(NULL) releases memory for ALL NCCL comms in this process
-    comm = _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
-    if comm is not None and comm.nccl.enable_amem_nccl:
-        if not comm.is_paused:
-            comm.nccl_pause()
-    else:
-        logger.warning("No PyNCCL communicator available or AMEM NCCL not enabled")
+    comm_list = [
+        _PYNCCL_TENSOR_MODEL_PARALLEL_COMM, 
+        _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM, 
+        _PYNCCL_DATA_PARALLEL_COMM, 
+        _PYNCCL_CONTEXT_PARALLEL_COMM, 
+        _PYNCCL_EXPERT_MODEL_PARALLEL_COMM
+        ]
+    valid_pause_num = 0
+    for comm in comm_list:
+        if comm is not None and comm.nccl.enable_amem_nccl:
+            if not comm.is_paused:
+                comm.nccl_pause()
+                valid_pause_num += 1
+    if valid_pause_num == 0:
+        logger.warning(f"PyNCCL communicator {comm} is not available or AMEM NCCL not enabled")
 
 
 def pynccl_resume_all():
@@ -1576,12 +1602,21 @@ def pynccl_resume_all():
     
     # Use TP communicator to call global ncclResume
     # ncclResume(NULL) restores memory for ALL NCCL comms in this process
-    comm = _PYNCCL_TENSOR_MODEL_PARALLEL_COMM
-    if comm is not None and comm.nccl.enable_amem_nccl:
-        if comm.is_paused:
-            comm.nccl_resume()
-    else:
-        logger.warning("No PyNCCL communicator available or AMEM NCCL not enabled")
+    comm_list = [
+        _PYNCCL_TENSOR_MODEL_PARALLEL_COMM, 
+        _PYNCCL_PIPELINE_MODEL_PARALLEL_COMM, 
+        _PYNCCL_DATA_PARALLEL_COMM, 
+        _PYNCCL_CONTEXT_PARALLEL_COMM, 
+        _PYNCCL_EXPERT_MODEL_PARALLEL_COMM
+        ]
+    valid_resume_num = 0
+    for comm in comm_list:
+        if comm is not None and comm.nccl.enable_amem_nccl:
+            if comm.is_paused:
+                comm.nccl_resume()
+                valid_resume_num += 1
+    if valid_resume_num == 0:
+        logger.warning(f"PyNCCL communicator {comm} is not available or AMEM NCCL not enabled")
 
 
 def get_pipeline_model_parallel_group(check_initialized=True):
