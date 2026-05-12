@@ -495,7 +495,11 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+        # ``if num_tokens > 0`` would force a GPU→CPU sync because num_tokens
+        # is a 0-dim CUDA tensor; that's illegal during full-iteration CUDA
+        # graph capture.  Compute the scale entirely on-device with clamp so
+        # we get a no-op (scale = 1) when num_tokens == 0 and the correct
+        # 1/num_tokens otherwise — same observable behavior, no host sync.
         for model_chunk in model:
-            if num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                model_chunk.scale_gradients(scaling)
+            scaling = 1.0 / num_tokens.clamp_min(1).to(torch.float32)
+            model_chunk.scale_gradients(scaling)

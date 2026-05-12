@@ -201,6 +201,28 @@ class P2PCommunicator:
         Returns:
             (recv_prev_shape, recv_next_shape)
         """
+        # Full-iteration CUDA graph capture cannot tolerate the
+        # `torch.cuda.synchronize()` and `.tolist()` calls below — they would
+        # cause `cudaErrorStreamCaptureUnsupported`.  When we are inside a
+        # capturing stream, return the most recently observed shape (cached
+        # during the eager warmup iteration). THD pre-padding makes every
+        # microbatch's per-rank tensor identical in shape, so the cached
+        # value is correct.
+        # Cache is class-level because P2PCommunicator instances are created
+        # fresh per ``forward_backward_pipelining_without_interleaving`` call.
+        # We track the prev-recv and next-recv shapes SEPARATELY because a
+        # single call only fills one of them — fwd populates recv_prev_shape
+        # and leaves recv_next_shape = [0,0,0]; bwd is the mirror. A naive
+        # tuple cache would clobber whichever direction the last call didn't
+        # touch.
+        if torch.cuda.is_current_stream_capturing():
+            cached_prev = getattr(P2PCommunicator, '_shape_cache_recv_prev', None)
+            cached_next = getattr(P2PCommunicator, '_shape_cache_recv_next', None)
+            return (
+                cached_prev if cached_prev is not None else [0, 0, 0],
+                cached_next if cached_next is not None else [0, 0, 0],
+            )
+
         config = self.config
         recv_prev_shape_tensor = None
         recv_next_shape_tensor = None
@@ -269,6 +291,16 @@ class P2PCommunicator:
         recv_next_shape = [0, 0, 0]
         if recv_next_shape_tensor is not None:
             recv_next_shape = recv_next_shape_tensor.tolist()
+
+        # Cache for the full-iteration CUDA graph fast-path (see top of fn).
+        # Only update each direction when this call actually queried it, so a
+        # fwd-only call doesn't clobber bwd's cached recv_next_shape and vice
+        # versa. THD makes shapes constant across microbatches so the most
+        # recent observation per direction is the right one to replay.
+        if recv_prev_shape_tensor is not None:
+            P2PCommunicator._shape_cache_recv_prev = recv_prev_shape
+        if recv_next_shape_tensor is not None:
+            P2PCommunicator._shape_cache_recv_next = recv_next_shape
 
         return recv_prev_shape, recv_next_shape
 
@@ -415,8 +447,14 @@ class P2PCommunicator:
 
         if config.batch_p2p_comm and config.batch_p2p_sync:
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
-            torch.cuda.synchronize()
+            # User should assert that we have a modern enough PyTorch to not need this.
+            # Skip this sync inside CUDA graph capture — torch.cuda.synchronize()
+            # raises cudaErrorStreamCaptureUnsupported on a capturing stream.
+            # The race condition this guards against is a PyTorch/NCCL issue
+            # already worked around in the modern PyTorch we depend on for graph
+            # capture.
+            if not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs
 

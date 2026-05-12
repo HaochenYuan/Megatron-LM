@@ -119,6 +119,29 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
+        # Fast path for the full-iteration CUDA graph:
+        # ``FullCudaGraphWrapper.pre_pad_fn`` already padded the batch and stored
+        # it in per-microbatch static CUDA buffers. Detect by sentinel key and
+        # skip both ``get_batch_on_this_rank_for_sequence_packing`` and
+        # ``pad_thd_for_cuda_graph`` (both would re-allocate tensors and call
+        # .item(), neither legal inside a captured graph). Peek the next item
+        # non-destructively by chaining it back onto the iterator if it is not
+        # pre-padded. Non-TP-0 ranks pass ``data_iterator=None`` and never have
+        # pre-padded data on this side, so skip the peek entirely.
+        if data_iterator is not None:
+            try:
+                first = next(data_iterator)
+            except StopIteration:
+                first = None
+            if isinstance(first, dict) and first.get('_thd_pre_padded', False):
+                from megatron.core.thd_full_iter import (
+                    reconstruct_thd_tuple_from_prepadded_dict,
+                )
+                return reconstruct_thd_tuple_from_prepadded_dict(first)
+            if first is not None:
+                import itertools
+                data_iterator = itertools.chain([first], data_iterator)
+
         result = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,

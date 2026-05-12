@@ -2867,7 +2867,41 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        # When the sequence-packing scheduler is on, dataloader microbatches
+        # have variable length and would break StaticBufferLoader's per-byte
+        # copy. The pre_pad_fn pads each raw batch up to the static THD buffer
+        # length (max_seqlen_per_dp_cp_rank) before it reaches the static
+        # buffer. ``get_batch`` then sees a pre-padded dict and bypasses its
+        # own padding step (no .item() / no fresh allocation inside the graph).
+        # Diagnostic env: THD_FI_DISABLE_PRE_PAD=1 bypasses our pre-pad path
+        # so the original (un-padded) iterator goes straight into static
+        # buffers — used to confirm whether our pre_pad_fn is the root of a
+        # downstream bug or whether it's elsewhere.
+        import os as _os
+        pre_pad_fn = None
+        if (
+            args.sequence_packing_scheduler is not None
+            and args.max_seqlen_per_dp_cp_rank is not None
+            and not bool(int(_os.environ.get('THD_FI_DISABLE_PRE_PAD', '0')))
+        ):
+            from megatron.core.thd_full_iter import make_prerun_pad_fn
+            _cfg_for_padfn = get_model_config(model[0]) if isinstance(model, list) else get_model_config(model)
+            pre_pad_fn = make_prerun_pad_fn(config=_cfg_for_padfn)
+        # Option B (multi-graph dispatch by K) knobs read from env to avoid
+        # adding new CLI args. Defaults are conservative; production callers
+        # should set THD_FI_K_MAX based on their dataset's K range.
+        _k_min = int(_os.environ.get('THD_FI_K_MIN', '1'))
+        _k_max = int(_os.environ.get('THD_FI_K_MAX', '64'))
+        _k_prewarm_str = _os.environ.get('THD_FI_K_PREWARM', '')
+        _k_prewarm = [int(x) for x in _k_prewarm_str.split(',') if x.strip()]
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            pre_pad_fn=pre_pad_fn,
+            k_min=_k_min,
+            k_max=_k_max,
+            k_prewarm=_k_prewarm,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3370,7 +3404,29 @@ def evaluate(
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        # Same THD pre-padding as in the train loop, applied to validation too.
+        pre_pad_fn = None
+        if (
+            args.sequence_packing_scheduler is not None
+            and args.max_seqlen_per_dp_cp_rank is not None
+        ):
+            from megatron.core.thd_full_iter import make_prerun_pad_fn
+            _cfg_for_padfn = get_model_config(model[0]) if isinstance(model, list) else get_model_config(model)
+            pre_pad_fn = make_prerun_pad_fn(config=_cfg_for_padfn)
+        # Option B knobs (env-driven; same defaults as the train wrapper).
+        import os as _os_v
+        _k_min = int(_os_v.environ.get('THD_FI_K_MIN', '1'))
+        _k_max = int(_os_v.environ.get('THD_FI_K_MAX', '64'))
+        _k_prewarm_str = _os_v.environ.get('THD_FI_K_PREWARM', '')
+        _k_prewarm = [int(x) for x in _k_prewarm_str.split(',') if x.strip()]
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            pre_pad_fn=pre_pad_fn,
+            k_min=_k_min,
+            k_max=_k_max,
+            k_prewarm=_k_prewarm,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors

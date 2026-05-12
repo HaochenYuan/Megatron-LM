@@ -133,6 +133,7 @@ def pad_thd_for_cuda_graph(
         actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
         mask_device = packed_seq_params.cu_seqlens_q.device
 
+    _max_individual = 0
     if actual_T is not None and packed_seq_params.cu_seqlens_q is not None:
         _cu = packed_seq_params.cu_seqlens_q
         _individual_lens = _cu[1:] - _cu[:-1]
@@ -158,6 +159,18 @@ def pad_thd_for_cuda_graph(
     position_ids = _pad_seq_tensor(position_ids, max_seqlen)
 
     target_cu_entries = max_num_seqs + 1
+    # PATCH: tighten max_seqlen_q/kv to the actual longest segment instead of M.
+    # TE flash-attn-bwd sizes its workspace as O(heads × max_seqlen_q × max_seqlen_kv)
+    # — passing M here causes a 32 GiB workspace when M=8192 even though real
+    # segments may be ≤2048. Using the actual max collapses workspace size by
+    # (M / max_individual)². Fallback to `max_seqlen` if we couldn't compute
+    # _max_individual (when no cu_seqlens are present yet).
+    #
+    # NOTE: for CP>1 the actual per-CP-rank chunk length might differ from the
+    # global _max_individual; this patch keeps the original M behavior in that
+    # path (handled by the cp_size>1 branch below) to avoid breaking CP
+    # partitioning. With cp_size==1 the local max == global max == _max_individual.
+    _tightened_max_seqlen = _max_individual if _max_individual > 0 else max_seqlen
     padded_params = PackedSeqParams(
         qkv_format=packed_seq_params.qkv_format,
         cu_seqlens_q=_pad_cu_seqlens(packed_seq_params.cu_seqlens_q, target_cu_entries),
@@ -168,8 +181,8 @@ def pad_thd_for_cuda_graph(
         cu_seqlens_kv_padded=_pad_cu_seqlens(
             packed_seq_params.cu_seqlens_kv_padded, target_cu_entries
         ),
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
+        max_seqlen_q=_tightened_max_seqlen,
+        max_seqlen_kv=_tightened_max_seqlen,
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
     )
