@@ -366,13 +366,13 @@ def _build_contiguous_packed_seq_roll_plan(
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
-    if cu.numel() > 1:
-        # Static packed metadata can repeat its final boundary to pad the number
-        # of cu_seqlens entries. Remove duplicates before assigning positions to
-        # packed intervals so every retained interval has a nonzero length.
-        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
-        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
-        cu = cu[nonduplicate_boundaries]
+    # Static packed metadata can repeat its final boundary to pad the number of cu_seqlens
+    # entries (zero-length intervals). They are harmless for everything below: ``bucketize``
+    # with ``right=True`` returns the first boundary strictly greater than a position, so a
+    # repeated boundary never becomes a sequence end for a live position, and ``cu[-1]`` /
+    # ``seq_ends[-1]`` are unchanged. Do NOT compact them with a boolean mask: that indexing
+    # is data-dependent (host synchronisation) and invalidates CUDA-graph capture when the
+    # post-process (MTP) runs inside a chunk graph.
 
     has_sequences = cu.numel() > 1
     if local_seq_len == 0 or not has_sequences:
@@ -1690,7 +1690,20 @@ class MTPLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MTPLossAutoScaler.main_loss_backward_scale = scale
+        # Graph-safe (same contract as MoEAuxLossAutoScaler): keep ONE persistent device tensor
+        # and update it in place. A CUDA graph that captured the MTP loss backward (e.g. the
+        # post-process captured with the chunk graphs) holds the address of this tensor; rebinding
+        # a new tensor every iteration would make the replayed backward read freed memory.
+        current = MTPLossAutoScaler.main_loss_backward_scale
+        if (
+            not torch.is_tensor(current)
+            or current.device != scale.device
+            or current.shape != scale.shape
+            or current.dtype != scale.dtype
+        ):
+            MTPLossAutoScaler.main_loss_backward_scale = scale.detach().clone()
+        else:
+            current.copy_(scale)
 
 
 def process_mtp_loss(
@@ -2492,12 +2505,12 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
 
         if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            assert (
-                self.config.recompute_num_layers == 1
-            ), "recompute_num_layers must be 1 for MTP recompute"
+            # MTP recompute checkpoints the whole single MTP layer forward
+            # (``_proj_and_transformer_layer``) as one unit via checkpoint_handler();
+            # it does not chunk by ``recompute_num_layers``. So the decoder's
+            # ``recompute_num_layers`` (e.g. 4) is irrelevant here — do not couple
+            # MTP recompute to it (the previous ``== 1`` assert was spurious and
+            # blocked full recompute + MTP whenever the decoder used chunks > 1).
             with outer_quantization_context:
                 outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':

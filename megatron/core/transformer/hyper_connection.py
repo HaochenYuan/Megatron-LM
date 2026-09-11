@@ -382,6 +382,11 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("MHC_compute_mappings")
+        from megatron.core.transformer.cuda_graphs import _rc_tap
+
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:
@@ -418,6 +423,11 @@ class HyperConnectionModule(MegatronModule):
         # matrix), so after the FP32 computation they are safe to apply to the
         # streams in the activation dtype.
         dtype = x.dtype
+        # RC TAP (MCORE_RC_TAP=1): mHC mappings are the discrete/iterative amplifier; tap them
+        # in the checkpoint forward and compare in the recompute.
+        _rc_tap("MHC_hpre", h_pre)
+        _rc_tap("MHC_hpost", h_post)
+        _rc_tap("MHC_hres", h_res)
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)

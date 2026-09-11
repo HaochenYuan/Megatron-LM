@@ -3,6 +3,7 @@
 import gc
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -38,6 +39,24 @@ def _make_chunk_handler_for_offload_checker(min_offloaded_tensor_size: int = 1):
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.min_offloaded_tensor_size = min_offloaded_tensor_size
     return handler
+
+
+def test_chunk_handler_does_not_finish_while_recorded_groups_remain():
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.offload_groups = [
+        SimpleNamespace(_name="core_attn"),
+        SimpleNamespace(_name="attn_proj"),
+    ]
+    handler._max_group_size = len(handler.offload_groups)
+    handler._offloaded_group_index = 1
+    handler._groups_to_offload = []
+    handler._groups_to_reload = []
+
+    assert not handler.finish_all_groups("attn_proj")
+    assert handler.finish_all_groups("core_attn")
+
+    handler._offloaded_group_index = 2
+    assert handler.finish_all_groups("attn_proj")
 
 
 def test_chunk_offload_handler_skips_non_offloadable_tensor_types():

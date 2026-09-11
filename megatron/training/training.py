@@ -20,7 +20,7 @@ import math
 import os
 import sys
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -2721,6 +2721,69 @@ def dummy_train_step(data_iterator):
             )
 
 
+@contextmanager
+def _graph_pool_lend_ctx(phase: str):
+    """Experiment (MCORE_GRAPH_POOL_LEND): route allocations made in an eager
+    phase (optimizer 'prefetch'/'step') into the chunk CUDA-graph private pool
+    so they reuse its inactive address space between replays.
+
+    Constraints established by standalone allocator probing:
+      - allocations must be made on the graph capture stream (allocator
+        free-lists are keyed by the block's home stream);
+      - every borrowed allocation must be dead before the next graph replay,
+        because replay writes to pool addresses unconditionally
+        (see MCORE_GRAPH_POOL_LEND_SYNC in train_step).
+    """
+    phases = os.environ.get('MCORE_GRAPH_POOL_LEND', '')
+    if not phases or phase not in phases.split(','):
+        yield
+        return
+    # Fit-gate proxy: lend only on ranks whose optimizer-phase staging demand
+    # fits the pool's inactive space (production design: offloader reports its
+    # expected staging bytes and this becomes an automatic per-rank decision).
+    lend_ranks = os.environ.get('MCORE_GRAPH_POOL_LEND_RANKS', '')
+    if lend_ranks and str(torch.distributed.get_rank()) not in lend_ranks.split(','):
+        yield
+        return
+    from megatron.core.transformer.cuda_graphs import (
+        get_chunk_graph_external_pool,
+        set_chunk_graph_pool_lend_active,
+    )
+
+    pool = get_chunk_graph_external_pool()
+    capture_stream = torch.cuda.graphs.graph.default_capture_stream
+    if pool is None or capture_stream is None:
+        yield
+        return
+    device = torch.cuda.current_device()
+    stats_before = torch.cuda.memory_stats(device)
+    current_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(current_stream)
+    stream_ctx = torch.cuda.stream(capture_stream)
+    stream_ctx.__enter__()
+    torch._C._cuda_beginAllocateCurrentThreadToPool(device, pool)
+    set_chunk_graph_pool_lend_active(True, home_stream=current_stream)
+    try:
+        yield
+    finally:
+        set_chunk_graph_pool_lend_active(False)
+        torch._C._cuda_endAllocateToPool(device, pool)
+        stream_ctx.__exit__(None, None, None)
+        current_stream.wait_stream(capture_stream)
+        stats_after = torch.cuda.memory_stats(device)
+        mib = 1024 * 1024
+        print(
+            f"GRAPH_POOL_LEND phase={phase} rank={torch.distributed.get_rank()} "
+            f"reserved_before={stats_before['reserved_bytes.all.current'] / mib:.0f} "
+            f"reserved_after={stats_after['reserved_bytes.all.current'] / mib:.0f} "
+            f"reserved_peak={stats_after['reserved_bytes.all.peak'] / mib:.0f} "
+            f"alloc_before={stats_before['allocated_bytes.all.current'] / mib:.0f} "
+            f"alloc_after={stats_after['allocated_bytes.all.current'] / mib:.0f} "
+            f"alloc_peak={stats_after['allocated_bytes.all.peak'] / mib:.0f}",
+            flush=True,
+        )
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -2780,7 +2843,8 @@ def train_step(
                 base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
 
             def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
-                optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                with _graph_pool_lend_ctx('prefetch'):
+                    optimizer.prefetch_optimizer_state_for_gradient_finalization()
                 return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
 
             setattr(
@@ -2883,6 +2947,14 @@ def train_step(
         if delay_master_offload_for_param_buffer:
             optimizer.offload_optimizer_state_for_forward()
 
+        if (
+            os.environ.get('MCORE_GRAPH_POOL_LEND', '')
+            and os.environ.get('MCORE_GRAPH_POOL_LEND_SYNC', '1') == '1'
+        ):
+            # Borrowed graph-pool blocks from the previous optimizer phase may
+            # still be draining D2H; the first replay below would clobber them.
+            torch.cuda.synchronize()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -2917,20 +2989,23 @@ def train_step(
                 getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
             )
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=forward_backward_data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=pg_collection,
-        )
+        from megatron.core.transformer.cuda_graphs import postprocess_lend_forward_backward_ctx
+
+        with postprocess_lend_forward_backward_ctx():
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=forward_backward_data_iterator,
+                model=model,
+                num_microbatches=num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=False,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -2968,6 +3043,39 @@ def train_step(
     if save_wgrads_in_this_iteration:
         _save_state_dict(attr_name="main_grad", label="wgrads")
 
+    # RCFLOW TRACE (MCORE_RCFLOW_TRACE=1): flush per-step recompute/replay entry-point counters.
+    from megatron.core.transformer.cuda_graphs import _rcflow_flush as _rcflow_flush_fn
+    from megatron.core.transformer.cuda_graphs import _rc_tap_flush as _rc_tap_flush_fn
+
+    _rcflow_flush_fn(iteration)
+    _rc_tap_flush_fn(iteration)
+
+    # EXPERIMENT (MCORE_GRAD_DUMP): per-parameter main_grad norm dump for early iters, to localize
+    # WHICH component's gradients diverge between chunk-recompute and eager/chunk-no-recompute. The
+    # forward is a captured graph replay (not python-instrumentable), but main_grad is a plain buffer
+    # readable here (eager optimizer-step point, sync is legal). Diff the per-param norms across arms.
+    if os.environ.get("MCORE_GRAD_DUMP", "0") == "1" and iteration <= int(
+        os.environ.get("MCORE_GRAD_DUMP_MAX_ITER", "2")
+    ):
+        import torch.distributed as _dist
+
+        _rank = _dist.get_rank() if _dist.is_initialized() else 0
+        _dir = os.environ.get("MCORE_GRAD_DUMP_DIR", "/tmp")
+        _path = f"{_dir}/graddump_it{iteration}_rank{_rank}.txt"
+        try:
+            with open(_path, "w") as _f:
+                for _mc in model:
+                    _umc = unwrap_model(_mc)
+                    for _pn, _p in _umc.named_parameters():
+                        _g = getattr(_p, "main_grad", None)
+                        if _g is not None:
+                            _f.write(
+                                f"{_pn}\t{float(_g.detach().float().norm()):.10e}\t{tuple(_g.shape)}\n"
+                            )
+            print(f"[GRADDUMP] wrote {_path}", flush=True)
+        except Exception as _e:  # pragma: no cover
+            print(f"[GRADDUMP] err {_e}", flush=True)
+
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return (
@@ -2996,7 +3104,27 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    # EXPERIMENT (MCORE_OPT_MEM_PROBE): phase-isolated optimizer-step memory. Measures the
+    # memory the step itself forces (peak during step minus resident before) — the true
+    # "optimizer memory overhead" of graph vs eager, distinct from the whole-iteration peak.
+    _opt_probe = os.environ.get('MCORE_OPT_MEM_PROBE', '0') == '1'
+    if _opt_probe:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        _resv_pre = torch.cuda.memory_reserved()
+        _alloc_pre = torch.cuda.memory_allocated()
+    with _graph_pool_lend_ctx('step'):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if _opt_probe:
+        torch.cuda.synchronize()
+        _resv_peak = torch.cuda.max_memory_reserved()
+        _alloc_peak = torch.cuda.max_memory_allocated()
+        print(
+            f"OPT_MEM_PROBE rank={torch.distributed.get_rank()} iter={args.curr_iteration} "
+            f"resv_pre={_resv_pre} resv_peak={_resv_peak} resv_new={_resv_peak - _resv_pre} "
+            f"alloc_pre={_alloc_pre} alloc_peak={_alloc_peak} alloc_step_transient={_alloc_peak - _alloc_pre}",
+            flush=True,
+        )
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -3005,6 +3133,37 @@ def train_step(
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
 
     timers('optimizer').stop()
+
+    # EXPERIMENT (MCORE_PHASE_MEM_PROBE): per-iteration, per-rank allocator breakdown by pool
+    # (chunk CUDA-graph private pool vs default pool) plus device-used, printed after the
+    # optimizer step. Snapshot-based; proxy-scale only.
+    if os.environ.get('MCORE_PHASE_MEM_PROBE', '0') == '1' and (
+        not os.environ.get('MCORE_PHASE_MEM_ITERS')
+        or str(args.curr_iteration) in os.environ['MCORE_PHASE_MEM_ITERS'].split(',')
+    ):
+        # MCORE_PHASE_MEM_ITERS="3,7,15" restricts the (snapshot-based, seconds at 128 GPUs) probe to
+        # those iterations so the other steps keep clean timing.
+        torch.cuda.synchronize()
+        _by_pool = {}
+        for _seg in torch.cuda.memory_snapshot():
+            _pid = tuple(_seg.get('segment_pool_id', (0, 0)))
+            _k = 'default' if _pid == (0, 0) else 'graph'
+            _e = _by_pool.setdefault(_k, [0, 0, 0])
+            _e[0] += _seg['total_size']
+            _e[1] += _seg.get('allocated_size', 0)
+            _e[2] += 1
+        _free, _total = torch.cuda.mem_get_info()
+        _mib = 1024 * 1024
+        print(
+            f"PHASE_MEM rank={torch.distributed.get_rank()} iter={args.curr_iteration} "
+            f"resv={torch.cuda.memory_reserved() // _mib} max_resv={torch.cuda.max_memory_reserved() // _mib} "
+            f"alloc={torch.cuda.memory_allocated() // _mib} max_alloc={torch.cuda.max_memory_allocated() // _mib} "
+            f"graph_resv={_by_pool.get('graph', [0, 0, 0])[0] // _mib} graph_alloc={_by_pool.get('graph', [0, 0, 0])[1] // _mib} "
+            f"graph_segs={_by_pool.get('graph', [0, 0, 0])[2]} "
+            f"default_resv={_by_pool.get('default', [0, 0, 0])[0] // _mib} default_alloc={_by_pool.get('default', [0, 0, 0])[1] // _mib} "
+            f"device_used={(_total - _free) // _mib}",
+            flush=True,
+        )
 
     # Checkpoint params with parameter names.
     if save_params_in_this_iteration:
@@ -3371,13 +3530,24 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
+        snapshot_iterations = {
+            int(value)
+            for value in os.getenv("MCORE_MEMORY_SNAPSHOT_ITERATIONS", "").split(",")
+            if value
+        }
+        rank = torch.distributed.get_rank()
+        snapshot_rank_selected = not args.profile_ranks or rank in args.profile_ranks
+        if (
+            args.record_memory_history
+            and snapshot_rank_selected
+            and (not snapshot_iterations or iteration in snapshot_iterations)
         ):
             snapshot = torch.cuda.memory._snapshot()
             from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
+            base, ext = os.path.splitext(args.memory_snapshot_path)
+            snapshot_path = f"{base}_iter-{iteration}_rank-{rank}{ext}"
+            with open(snapshot_path, 'wb') as f:
                 dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
@@ -4328,6 +4498,23 @@ def train(
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model, param_sync=False)
             cuda_graph_helper.create_cudagraphs()
+            # The warm-up passes run inside CUDA-graph capture execute the training path and
+            # accumulate into the per-step loss logging trackers (MoE aux losses, DSA indexer
+            # loss). Reset them so the capture step logs only its real step (otherwise the
+            # indexer loss logged at this iteration is inflated by ~50%).
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerLossLoggingHelper,
+            )
+            from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+
+            clear_aux_losses_tracker()
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+            # MTP loss tracker (relevant when the post-process is captured with the chunk graphs).
+            MTPLossLoggingHelper.clean_loss_in_tracker()
+            print_rank_0(
+                '> cleared MoE/DSA loss trackers after CUDA-graph capture (warm-up passes are not '
+                'part of the training step)'
+            )
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()

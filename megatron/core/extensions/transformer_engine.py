@@ -3150,6 +3150,9 @@ def te_checkpoint(
     forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
 ):
     """Checkpointing with Transformer-Engine."""
+    from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+    _rcflow_hit("TE_ckpt_call")
     if not HAVE_TE:
         raise ImportError(
             "Transformer Engine is not installed. "
@@ -3157,6 +3160,14 @@ def te_checkpoint(
         )
 
     from transformer_engine.pytorch.distributed import checkpoint
+
+    from megatron.core.transformer.recompute_window import checkpoint_window
+
+    # Run the checkpointed forward and its recompute inside a recompute window so stochastic
+    # ops (e.g. forced-load-balancing router logits) replay the forward's draw during the
+    # recompute. RNG-state restore alone does not reproduce the draw with graph-safe RNG
+    # states (TE RNG tracker) or inside captured CUDA graphs.
+    forward_func = checkpoint_window(forward_func)
 
     if is_te_min_version("1.5.0"):
         return checkpoint(

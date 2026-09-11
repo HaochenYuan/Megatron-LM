@@ -648,6 +648,9 @@ class CheckpointFunction(torch.autograd.Function):
         *args: Unpack[_Ts],
     ) -> _R:
         """Forward pass."""
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("TP_ckptfn_fwd")
         _set_checkpointing()
 
         ctx.run_function = run_function
@@ -684,6 +687,9 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), "
                 "please use .backward() if possible"
             )
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("TP_ckptfn_bwd")
         _set_checkpointing()
 
         inputs = ctx.saved_tensors
@@ -725,9 +731,19 @@ def checkpoint(
     # Skip checkpointing during CUDA graph warmup and capture, matching the behavior of
     # CheckpointWithoutOutput. The graph captures all ops directly; recomputation cannot
     # run inside a captured graph.
+    from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
     if is_graph_warmup() or is_graph_capturing():
+        _rcflow_hit("TP_ckpt_skip")
         return function(*args)
-    return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+    _rcflow_hit("TP_ckpt_apply")
+    from megatron.core.transformer.recompute_window import checkpoint_window
+
+    # Stochastic ops inside the checkpoint replay the forward's draw during the recompute
+    # (see recompute_window.py); RNG-state restore alone is not exact with graph-safe RNG.
+    return CheckpointFunction.apply(
+        checkpoint_window(function), distribute_saved_activations, *args
+    )
 
 
 def _save_args_to_ctx(ctx, args):

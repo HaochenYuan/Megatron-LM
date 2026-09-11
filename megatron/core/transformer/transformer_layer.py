@@ -930,6 +930,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        # RC TAP (MCORE_RC_TAP=1): attention-sublayer residual (MLP entry) and pre-MLP norm.
+        from megatron.core.transformer.cuda_graphs import _rc_tap
+
+        _rc_tap("ATTN_RES", hidden_states)
+        _rc_tap(
+            "PRE_MLP_LN",
+            pre_mlp_layernorm_output[0]
+            if isinstance(pre_mlp_layernorm_output, tuple)
+            else pre_mlp_layernorm_output,
+        )
 
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
@@ -1037,6 +1047,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = (mlp_output, mlp_bias)
 
         nvtx_range_pop(suffix="mlp")
+        _rc_tap("MLP_OUT", mlp_output_with_bias[0])
         return mlp_output_with_bias, residual
 
     def _forward_mlp(

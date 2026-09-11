@@ -212,6 +212,9 @@ class ScheduleNode:
         return self._forward(*inputs)
 
     def _forward(self, *inputs):
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("NODE__forward")
         # Lazy initialization of stream
         if isinstance(self.stream, Callable):
             self.stream = self.stream()

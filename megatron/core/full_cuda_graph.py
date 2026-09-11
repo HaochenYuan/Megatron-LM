@@ -5,6 +5,8 @@
 import gc
 import logging
 
+import os
+
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
@@ -25,6 +27,15 @@ def get_shared_capture_stream():
     """
     global _shared_capture_stream
     if _shared_capture_stream is None:
+        if os.environ.get('MCORE_GRAPH_UNIFY_POOL', '0') == '1':
+            # Experiment: capture on the same stream as the TE chunk graphs. The caching allocator
+            # keys a private pool's free blocks by their home stream, so an optimizer graph captured
+            # on a different stream cannot reuse the chunk graphs' idle blocks even inside the same
+            # pool (observed: +0.7 GB new segments, identical to using a separate pool).
+            te_stream = torch.cuda.graphs.graph.default_capture_stream
+            if te_stream is not None:
+                _shared_capture_stream = te_stream
+                return _shared_capture_stream
         _shared_capture_stream = torch.cuda.Stream()
     return _shared_capture_stream
 

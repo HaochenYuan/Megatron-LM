@@ -498,6 +498,12 @@ class MockVarlenDataset(MockSFTDataset):
         # to make the conversation end on a stop token, mirroring the real
         # VarlenDataset path.
         raw = self.dataset[int(self.indices[idx % len(self.indices)])]
+        # distribution 模式的 MockSFTLowLevelDataset 返回 arange(1, length)，当
+        # seq_len > vocab_size 时 token id 会越界（触发 embedding device-side assert）。
+        # token 值对模型 shape/FLOPs 无影响，取模压回 [0, vocab) 保证 embedding 合法。
+        _vocab = getattr(tokenizer, 'vocab_size', None)
+        if _vocab:
+            raw = raw % _vocab
         tokens_list = raw.tolist()
         tokens_list.append(eod)
         # Mock data uses ``tokens == targets`` (no role masking).

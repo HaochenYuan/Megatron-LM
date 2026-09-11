@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -34,6 +35,28 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
 else:
     (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
+
+
+# Experiment (MCORE_SHARE_ROTARY=1): DSv4 hybrid attention builds one rotary
+# embedding module PER attention layer. Every layer with an identical rotary
+# config computes bit-identical cos/sin, so the per-layer emb + cos_cached +
+# sin_cached buffers (~512 MiB/layer at 1M seqlen; snapshot: 21 identical copies
+# = ~10 GiB/rank) are pure duplication. Sharing one instance per config collapses
+# them to a single copy. The module has NO parameters and only persistent=False
+# buffers, so sharing across layers is state_dict-safe and does not affect the
+# distributed optimizer / DDP; buffers are created lazily on-device. Symmetric
+# (helps eager and chunk-graph identically); default off (fresh per-layer module).
+_SHARED_ROTARY_CACHE: dict = {}
+
+
+def _get_shared_rotary(key, factory):
+    if os.environ.get("MCORE_SHARE_ROTARY", "0") != "1":
+        return factory()
+    inst = _SHARED_ROTARY_CACHE.get(key)
+    if inst is None:
+        inst = factory()
+        _SHARED_ROTARY_CACHE[key] = inst
+    return inst
 
 
 @torch.compile
@@ -129,23 +152,46 @@ class DSv4HybridAttention(Attention):
         self._dsv4_rope_base = rope_base
         self._dsv4_uses_yarn_rope = use_compressed_yarn
         if not use_compressed_yarn:
-            self.rotary_pos_emb = RotaryEmbedding(
-                self.config.qk_pos_emb_head_dim,
-                rotary_percent=self.config.rotary_percent,
-                rotary_base=rope_base,
-                cp_group=self.pg_collection.cp,
+            self.rotary_pos_emb = _get_shared_rotary(
+                (
+                    "rope",
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.rotary_percent,
+                    rope_base,
+                    id(self.pg_collection.cp),
+                ),
+                lambda: RotaryEmbedding(
+                    self.config.qk_pos_emb_head_dim,
+                    rotary_percent=self.config.rotary_percent,
+                    rotary_base=rope_base,
+                    cp_group=self.pg_collection.cp,
+                ),
             )
         else:
-            self.rotary_pos_emb = YarnRotaryEmbedding(
-                self.config.qk_pos_emb_head_dim,
-                rotary_base=rope_base,
-                scaling_factor=self.config.rotary_scaling_factor,
-                original_max_position_embeddings=self.config.original_max_position_embeddings,
-                beta_fast=self.config.beta_fast,
-                beta_slow=self.config.beta_slow,
-                mscale=self.config.mscale,
-                mscale_all_dim=self.config.mscale_all_dim,
-                cp_group=self.pg_collection.cp,
+            self.rotary_pos_emb = _get_shared_rotary(
+                (
+                    "yarn",
+                    self.config.qk_pos_emb_head_dim,
+                    rope_base,
+                    self.config.rotary_scaling_factor,
+                    self.config.original_max_position_embeddings,
+                    self.config.beta_fast,
+                    self.config.beta_slow,
+                    self.config.mscale,
+                    self.config.mscale_all_dim,
+                    id(self.pg_collection.cp),
+                ),
+                lambda: YarnRotaryEmbedding(
+                    self.config.qk_pos_emb_head_dim,
+                    rotary_base=rope_base,
+                    scaling_factor=self.config.rotary_scaling_factor,
+                    original_max_position_embeddings=self.config.original_max_position_embeddings,
+                    beta_fast=self.config.beta_fast,
+                    beta_slow=self.config.beta_slow,
+                    mscale=self.config.mscale,
+                    mscale_all_dim=self.config.mscale_all_dim,
+                    cp_group=self.pg_collection.cp,
+                ),
             )
 
         core_attn_extra_kwargs = {

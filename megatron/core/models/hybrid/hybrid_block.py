@@ -959,6 +959,19 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
+                import os as _os
+
+                from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+                _rcflow_hit("HSFWD_ckptfwd")
+                if _os.environ.get("MCORE_TRACE_DISPATCH") == "1":
+                    import torch as _torch
+
+                    print(
+                        f"[TRACE_HSFWD] HybridStack.forward -> checkpointed_forward "
+                        f"grad={_torch.is_grad_enabled()} nlayers={len(self.layers)}",
+                        flush=True,
+                    )
                 hidden_states = checkpointed_forward(
                     self,
                     hidden_states=hidden_states,

@@ -370,6 +370,9 @@ class GraphableMegatronModule(MegatronModule):
         However, CUDA graph accepts only Tensor inputs.
         Hence, check if the arguments are all tensors.
         """
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("L_te_replay")
         for arg in args:
             assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
         for _, v in kwargs.items():

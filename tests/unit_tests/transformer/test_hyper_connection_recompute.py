@@ -594,6 +594,24 @@ class TestTransformerConfigRecomputeMhc:
         )
         assert config.cuda_graph_granularity == "chunk"
 
+    def test_config_accepts_te_chunk_graph_with_mhc_recompute_and_attention_offload(self):
+        """The outer chunk callable owns the offload synchronization edges."""
+        config = TransformerConfig(
+            **self._mhc_recompute_config_kwargs(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_granularity="chunk",
+                cuda_graph_modules=[],
+                recompute_modules=["mhc"],
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                fine_grained_activation_offloading=True,
+                offload_modules=["core_attn"],
+                cuda_graph_warmup_steps=2,
+            )
+        )
+        assert config.cuda_graph_granularity == "chunk"
+        assert config.offload_modules == ["core_attn"]
+
     def test_hybrid_mhc_layer_accepts_outer_te_chunk_graph(self):
         """Hybrid layers stay eager Python children while the outer stack is captured."""
         from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer

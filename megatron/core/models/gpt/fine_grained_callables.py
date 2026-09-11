@@ -410,6 +410,9 @@ class TransformerLayerNode(ScheduleNode):
 
     def forward_impl(self, *args):
         """Calls the submodule as the forward pass."""
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("TLNODE_forward_impl")
         return self.submodule(self, *args)
 
     def backward_impl(self, outputs, output_grad):
@@ -636,7 +639,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             if is_hyper_connection_layer and layer._uses_mhc_recompute_attn_cuda_graph_split():
                 layer._mhc_recompute_manager = mhc_recompute_manager
             forward_func = layer._te_cuda_graph_replay
+            from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+            _rcflow_hit("SUB_attn_replay")
         else:
+            from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+            _rcflow_hit("SUB_attn_eager")
+
             # wrapper function that keeps consistent api with cuda graph replay
             def forward_func(
                 hidden_states: Tensor,

@@ -29,6 +29,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
@@ -214,6 +215,26 @@ class TestHybridModel:
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    def test_linear_cross_entropy_output_layer(self):
+        model_config = TransformerConfig(
+            num_layers=3,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cross_entropy_loss_fusion=True,
+            cross_entropy_fusion_impl="linear",
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="M*-",
+        )
+
+        assert model.fuse_linear_cross_entropy
+        assert isinstance(model.output_layer, LinearCrossEntropyModule)
 
     def test_constructor_with_hyper_connections(self):
         model_config = TransformerConfig(

@@ -12,9 +12,11 @@ therefore only ever observes regular CUDA tensors and does not need an offload-s
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 import logging
 import math
+import os
 from typing import Callable, Dict, Iterable, List, Mapping, Sequence
 
 import torch
@@ -664,15 +666,27 @@ class ChunkedOptimizerStateOffloader:
             return
 
         self._master_weights_resident = False
-        gpu_transfers = [
-            (
-                param,
-                state_key,
-                cpu_tensor,
-                torch.empty_like(cpu_tensor, device=self._param_devices[param]),
-            )
-            for param, state_key, cpu_tensor in transfers
-        ]
+        # Master H2D buffers are the single largest optimizer-phase allocation
+        # (whole master window, restored in one shot per PR #6244). They cannot
+        # fit the graph pool's inactive space on deep PP stages, so keep them in
+        # the default pool even when optimizer-phase lending is active; only the
+        # smaller, chunked state staging and Muon transients borrow the pool.
+        if os.environ.get('MCORE_GRAPH_POOL_LEND_MASTER_BYPASS', '0') == '1':
+            from megatron.core.transformer.cuda_graphs import pool_alloc_bypass
+
+            master_alloc_ctx = pool_alloc_bypass()
+        else:
+            master_alloc_ctx = contextlib.nullcontext()
+        with master_alloc_ctx:
+            gpu_transfers = [
+                (
+                    param,
+                    state_key,
+                    cpu_tensor,
+                    torch.empty_like(cpu_tensor, device=self._param_devices[param]),
+                )
+                for param, state_key, cpu_tensor in transfers
+            ]
 
         self._order_h2d_after_source_streams()
         with torch.cuda.stream(self._h2d_stream):

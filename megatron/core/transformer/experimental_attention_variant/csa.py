@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -34,6 +35,9 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     fused_csa_indexer_sparse_attn,
     indexer_topk,
 )
+# A checkpoint forward runs under no_grad but must select the same kernels as its recompute
+# (see recompute_window.py); otherwise the recompute is a different function than the loss's.
+from megatron.core.transformer.recompute_window import checkpoint_forward_uses_training_path
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -1432,6 +1436,40 @@ class CSAIndexerSubmodules:
     compressor: Union[ModuleSpec, type] = None
 
 
+_TOPK_DUMP_COUNTER = {}
+
+
+def _topk_dump(layer_number, topk_indices, qsig):
+    """Debug (MCORE_TOPK_DUMP=1): save the indexer top-k selection + a query signature to
+    MCORE_TOPK_DUMP_DIR. Both eager (grad forward) and the chunk-graph (backward-time recompute)
+    reach the indexer training path, but in DIFFERENT microbatch orders (forward vs 1F1B/VPP
+    backward). So the offline compare pairs dumps ACROSS runs by nearest ``qsig`` (recompute noise
+    << inter-microbatch difference), not by call order, then measures the DISCRETE top-k flip.
+    Skipped during graph capture (dummy static inputs); capped per (layer, rank) to iter-1's
+    microbatches."""
+    if os.environ.get("MCORE_TOPK_DUMP", "0") != "1" or topk_indices is None:
+        return
+    try:
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        if is_graph_capturing():
+            return
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        c = _TOPK_DUMP_COUNTER.get((layer_number, rank), 0)
+        _TOPK_DUMP_COUNTER[(layer_number, rank)] = c + 1
+        if c >= 8:
+            return
+        d = os.environ.get("MCORE_TOPK_DUMP_DIR", ".")
+        path = os.path.join(d, f"topk_L{layer_number}_r{rank}_i{c}.pt")
+        torch.save(
+            {"topk": topk_indices.detach().to(torch.int32).cpu(), "qsig": qsig}, path
+        )
+    except Exception:
+        pass
+
+
 class CSAIndexer(MegatronModule):
     """Learned top-k retrieval over compressed positions for CSA sparse attention.
 
@@ -1868,7 +1906,7 @@ class CompressedSparseAttention(MegatronModule):
                     .expand(b, -1, -1)
                 )  # [b, sq, n_compressed]
 
-                if self.training and torch.is_grad_enabled():
+                if self.training and (torch.is_grad_enabled() or checkpoint_forward_uses_training_path()):
                     q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
                         x_det, qr_det, packed_seq_params
                     )
@@ -1898,7 +1936,7 @@ class CompressedSparseAttention(MegatronModule):
                         True,
                         non_compressed_lse,
                     )
-                    if indexer_loss_coeff > 0:
+                    if indexer_loss_coeff > 0 and torch.is_grad_enabled():
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                             loss=indexer_loss,
                             layer_number=self.layer_number,
@@ -2052,7 +2090,7 @@ class CompressedSparseAttention(MegatronModule):
         )
         nvtx_range_pop("sparse_attn_kernel")
 
-        if indexer_loss_coeff > 0:
+        if indexer_loss_coeff > 0 and torch.is_grad_enabled():
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
                 layer_number=self.layer_number,
@@ -2144,7 +2182,7 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
             )
-        elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+        elif has_indexer_compressed and self.training and (torch.is_grad_enabled() or checkpoint_forward_uses_training_path()):
             output, indexer_loss = self._forward_fused_indexer_training(
                 query, x, qr, kv_full, n_compressed, offset, window_idxs, packed_seq_params
             )
@@ -2201,7 +2239,7 @@ class CompressedSparseAttention(MegatronModule):
                 x_det = x.detach()
                 qr_det = qr.detach()
 
-                if self.training and torch.is_grad_enabled():
+                if self.training and (torch.is_grad_enabled() or checkpoint_forward_uses_training_path()):
                     q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
                         self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
                     )
@@ -2262,7 +2300,7 @@ class CompressedSparseAttention(MegatronModule):
                         topk_indices_global, compressed_offsets
                     )
 
-                    if indexer_loss_coeff > 0:
+                    if indexer_loss_coeff > 0 and torch.is_grad_enabled():
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                             loss=indexer_loss,
                             layer_number=self.layer_number,
@@ -2486,6 +2524,36 @@ class CompressedSparseAttention(MegatronModule):
         w_thd = weights_indexer.squeeze(1)
         k_thd = k_indexer.squeeze(1)
 
+        # Debug (MCORE_TOPK_DUMP=1): dump the indexer top-k. Both eager (grad forward) and the
+        # chunk-graph recompute reach this training path; comparing dumps across an eager and a
+        # chunk run measures the discrete top-k flip under recompute. Redundant side-compute, gated
+        # off during capture so it never enters the captured graph; output unused (no grad impact).
+        if os.environ.get("MCORE_TOPK_DUMP", "0") == "1":
+            from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+            if not is_graph_capturing():
+                _dump_topk_cmp, _ = indexer_topk(
+                    q_thd,
+                    k_thd,
+                    w_thd,
+                    topk=self.indexer.index_topk,
+                    ratio=self.compress_ratio,
+                    indexer_softmax_scale=self.indexer.softmax_scale,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_compressed_idx,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_compressed_idx,
+                )
+                # Query signature: pairs this dump to the same microbatch in the other run
+                # (same data => near-identical q; recompute noise is tiny vs inter-mb spread).
+                _qf = q_thd.detach().float()
+                _qsig = (
+                    float(_qf.sum().item()),
+                    float(_qf.pow(2).sum().item()),
+                    int(q_thd.shape[0]),
+                )
+                _topk_dump(self.layer_number, _dump_topk_cmp, _qsig)
+
         # Supply unpadded cu_seqlens so padding rows are excluded from
         # the indexer KL loss (mirrors the unfused path's cu_seqlens_q_for_loss).
         # Only pass when they actually differ (by reference or storage) to avoid
@@ -2525,7 +2593,7 @@ class CompressedSparseAttention(MegatronModule):
             cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
         )
 
-        if indexer_loss_coeff > 0:
+        if indexer_loss_coeff > 0 and torch.is_grad_enabled():
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
                 layer_number=self.layer_number,
@@ -2585,7 +2653,7 @@ class CompressedSparseAttention(MegatronModule):
         ratio = self.compress_ratio
         indexer = self.indexer
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
-        training_with_grad = self.training and torch.is_grad_enabled()
+        training_with_grad = self.training and (torch.is_grad_enabled() or checkpoint_forward_uses_training_path())
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         local_k_indexer_grad_edge = None
         indexer_k_rs_state = None
@@ -2868,7 +2936,7 @@ class CompressedSparseAttention(MegatronModule):
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
                     *indexer_loss_args, tp_group=indexer.pg_collection.tp
                 )
-            if indexer_loss_coeff > 0:
+            if indexer_loss_coeff > 0 and torch.is_grad_enabled():
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
@@ -2977,7 +3045,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         # ---- Step 4: path dispatch --------------------------------------------
-        is_training = self.training and torch.is_grad_enabled()
+        is_training = self.training and (torch.is_grad_enabled() or checkpoint_forward_uses_training_path())
         has_indexer = (
             self.compress_ratio > 1 and n_compressed_total > 0 and self.indexer is not None
         )

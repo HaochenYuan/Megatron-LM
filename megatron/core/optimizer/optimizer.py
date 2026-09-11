@@ -1931,8 +1931,19 @@ class ChainedOptimizer(MegatronOptimizer):
             grad_norms = []
             for optimizer in self.chained_optimizers:
                 _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+                # Graph-safe aggregation: `if _grad_norm` / math.sqrt() on a CUDA tensor force a
+                # host sync, which is illegal while the optimizer step is being captured into a
+                # CUDA graph (--optimizer-cuda-graph). Keep tensors as tensors; a None (stub
+                # optimizer) contributes nothing, exactly like the former falsy check.
+                if _grad_norm is None:
+                    continue
+                grad_norms.append(_grad_norm)
+            if not grad_norms:
+                grad_norm = 0.0
+            elif any(isinstance(x, torch.Tensor) for x in grad_norms):
+                grad_norm = torch.sqrt(sum(x**2 for x in grad_norms))
+            else:
+                grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
         return grad_norm
 
     @torch.no_grad()

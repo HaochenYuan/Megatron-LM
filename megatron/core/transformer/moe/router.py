@@ -699,12 +699,16 @@ class TopKRouter(Router):
         """
         if self.config.moe_input_jitter_eps is not None:
             eps = self.config.moe_input_jitter_eps
-            if self.input_jitter is None:
-                self.input_jitter = torch.distributions.uniform.Uniform(
-                    torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
-                    torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
-                ).rsample
-            return input * self.input_jitter(input.shape)
+            # Seed-replayed U[1-eps, 1+eps) jitter: an activation-checkpoint recompute reuses the
+            # forward's seed, and the stash stays 16 bytes regardless of the input size.
+            from megatron.core.transformer.recompute_window import (
+                hash_uniform,
+                recompute_consistent_seed,
+            )
+
+            seed = recompute_consistent_seed(("moe_input_jitter", self.layer_number), input.device)
+            jitter = 1.0 - eps + 2.0 * eps * hash_uniform(seed, input.shape, input.dtype)
+            return input * jitter
         else:
             return input
 
@@ -923,8 +927,9 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
-            logits = apply_random_logits(logits)
+            # Apply force load balancing with random logits for benchmark. The layer number
+            # keys the draw so an activation-checkpoint recompute replays the forward's routing.
+            logits = apply_random_logits(logits, stash_id=self.layer_number)
 
         if self.config.moe_router_force_biased is not None:
             # Apply biased logits with shared random bias across all ranks
@@ -938,6 +943,12 @@ class TopKRouter(Router):
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
         )
+        # RC TAP (MCORE_RC_TAP=1): router decisions in checkpoint forward vs recompute.
+        from megatron.core.transformer.cuda_graphs import _rc_tap
+
+        _rc_tap("ROUTER_logits", logits)
+        _rc_tap("ROUTER_probs", probs)
+        _rc_tap("ROUTER_map", routing_map)
 
         return probs, routing_map
 

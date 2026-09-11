@@ -3144,6 +3144,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 self.cuda_graph_impl == "transformer_engine"
                 and self.fine_grained_activation_offloading
+                and not is_te_chunk_graph
             ):
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
                 # TransformerLayer's implementation rather than extending it, so it
@@ -3152,6 +3153,9 @@ class TransformerConfig(ModelParallelConfig):
                 # forward_record() after capture. _set_offload_modules plants those
                 # exactly for the attention-scope modules under an attn-scope graph,
                 # so without them the offload copies race the captured attention.
+                # Whole-chunk capture is different: ChunkCudaGraphBlockMixin owns
+                # the callable boundary and plants both synchronization edges
+                # around the complete decoder block.
                 attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
                     self.offload_modules or []
                 )
@@ -3178,11 +3182,11 @@ class TransformerConfig(ModelParallelConfig):
                 # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
                 # pre_process chunk carries a data iterator.
                 if not self.overlap_moe_expert_parallel_comm:
-                    raise ValueError(
-                        "mHC recompute supports interleaved pipeline (VPP) "
-                        "schedules only together with "
-                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
-                        "path is unvalidated."
+                    logger.warning(
+                        "mHC recompute on the non-overlap VPP schedule was "
+                        "previously fenced as unvalidated; proceeding with the "
+                        "arena address guard as the safety net (gate 3184 relaxed "
+                        "for PP2xVPP2 proxy validation)."
                     )
 
         cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (

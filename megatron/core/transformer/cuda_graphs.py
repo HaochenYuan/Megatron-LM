@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -67,8 +67,265 @@ except:
     HAVE_TQDM = False
 
 _IS_GRAPH_CAPTURING = False
+
+# PROBE (env MCORE_EAGER_RECOMPUTE=1): when set True by recompute.py around the
+# activation-checkpoint backward RERUN (grad-enabled recompute), the post-capture
+# dispatch runs the module EAGER instead of re-replaying the graph. Tests whether the
+# graph re-replay during recompute (buffer-metadata loss, see the ~L1200 jiemingz TODO)
+# is the source of the full-recompute mHC divergence. Forward replay is unaffected.
+_MCORE_EAGER_RECOMPUTE_ACTIVE = False
+_MCORE_EAGER_RC_HITS = 0  # count of dispatch calls that took the eager-return path
+# Always-on flag (set by recompute.py custom_forward) = True while inside the activation-checkpoint
+# backward RERUN (grad-enabled recompute). Lets any graph path know it is executing a recompute.
+_MCORE_IN_RECOMPUTE = False
+
+
+def _set_in_recompute(value: bool) -> None:
+    """Mark whether execution is inside the activation-checkpoint backward rerun."""
+    global _MCORE_IN_RECOMPUTE
+    _MCORE_IN_RECOMPUTE = bool(value)
+
+
+def _get_in_recompute() -> bool:
+    """Whether execution is currently inside the activation-checkpoint backward rerun."""
+    return _MCORE_IN_RECOMPUTE
+
+
+# DIAGNOSTIC: True while create_bwd_graph is capturing the backward (its autograd.grad re-runs the
+# checkpointed forward = the graph recompute). Lets the DSA dump tag fwd-capture vs bwd-recompute.
+_MCORE_IN_BWD_CAPTURE = False
+# DIAGNOSTIC counters (MCORE_BWD_META_PROBE): [reuse-branch, metadata-lost-fallback] across create_bwd_graph.
+_bwd_meta_counts = [0, 0]
+
+
+def _set_in_bwd_capture(value: bool) -> None:
+    global _MCORE_IN_BWD_CAPTURE
+    _MCORE_IN_BWD_CAPTURE = bool(value)
+
+
+def _get_in_bwd_capture() -> bool:
+    return _MCORE_IN_BWD_CAPTURE
+
+
+# RCFLOW TRACE (env MCORE_RCFLOW_TRACE=1, inert otherwise): count every candidate recompute /
+# replay entry point per training step, keyed by (site, grad_enabled, inside RecomputeSegment.
+# recompute, graph capturing, graph warmup). Flushed once per step from training.py. Purpose: map
+# the REAL post-capture control flow (which recompute mechanism runs, replay vs eager) instead of
+# inferring it from code fragments.
+_RCFLOW_ON = os.environ.get("MCORE_RCFLOW_TRACE", "0") == "1"
+_RCFLOW_IN_SEG_RC = False
+_RCFLOW_COUNTS = {}
+
+
+def _rcflow_hit(site: str) -> None:
+    if not _RCFLOW_ON:
+        return
+    key = (site, torch.is_grad_enabled(), _RCFLOW_IN_SEG_RC, is_graph_capturing(), is_graph_warmup())
+    _RCFLOW_COUNTS[key] = _RCFLOW_COUNTS.get(key, 0) + 1
+
+
+def _rcflow_set_seg(value: bool) -> None:
+    global _RCFLOW_IN_SEG_RC
+    _RCFLOW_IN_SEG_RC = bool(value)
+
+
+def _rcflow_flush(iteration: int) -> None:
+    if not _RCFLOW_ON:
+        return
+    try:
+        import torch.distributed as _dist
+
+        rank = _dist.get_rank() if _dist.is_initialized() else 0
+    except Exception:  # pragma: no cover
+        rank = 0
+    for k in sorted(_RCFLOW_COUNTS, key=lambda t: (t[0], t[1], t[2], t[3], t[4])):
+        print(
+            f"[RCFLOW] it={iteration} rank={rank} site={k[0]} grad={k[1]} in_seg_rc={k[2]} "
+            f"capturing={k[3]} warmup={k[4]} n={_RCFLOW_COUNTS[k]}",
+            flush=True,
+        )
+    _RCFLOW_COUNTS.clear()
+
+
+# RC TAP (env MCORE_RC_TAP=1, inert otherwise): compare the activation-checkpoint RECOMPUTE against
+# the FORWARD it is supposed to reproduce, tensor by tensor, for the SAME microbatch. The forward
+# (grad disabled inside te_checkpoint) copies each tapped tensor into a static buffer keyed by the
+# checkpoint input's address + tap name; the recompute (grad enabled) looks up that buffer and
+# accumulates max|rc - fwd| and the count of unequal elements. All of this is plain tensor work, so
+# under CUDA graphs it is baked into the fwd/bwd graphs and evaluated at replay for every microbatch;
+# the accumulators are read and reset once per step from training.py. Same-key pairing is exactly
+# the static-buffer liveness guarantee the graphs already rely on (a checkpoint input address is not
+# reused until its backward retired), so fwd/rc pairs always belong to the same microbatch.
+_RC_TAP_ON = os.environ.get("MCORE_RC_TAP", "0") == "1"
+_RC_TAP_FWD = {}  # (input_ptr, tag) -> static buffer holding the forward value
+_RC_TAP_MAX = {}  # tag -> running max |rc - fwd| (fp32 scalar, device)
+_RC_TAP_NEQ = {}  # tag -> running count of unequal elements (int64 scalar, device)
+_RC_TAP_NUMEL = {}  # tag -> numel
+_RC_TAP_NOFWD = {}  # tag -> recompute taps that found no matching forward buffer
+_RC_TAP_STATE = {"key": None, "rc": False, "counts": {}, "prefix": ""}
+
+
+def _rc_tap_begin(hidden_states, prefix: str = "") -> None:
+    """Start a tap window at checkpoint-function entry (forward or recompute)."""
+    if not _RC_TAP_ON:
+        return
+    _RC_TAP_STATE["key"] = (
+        int(hidden_states.data_ptr()) if torch.is_tensor(hidden_states) else None
+    )
+    _RC_TAP_STATE["rc"] = torch.is_grad_enabled()
+    _RC_TAP_STATE["counts"] = {}
+    _RC_TAP_STATE["prefix"] = prefix
+
+
+def _rc_tap(name: str, t) -> None:
+    """Record (forward) or compare (recompute) one tensor. Repeated names get a #n suffix."""
+    if not _RC_TAP_ON or not torch.is_tensor(t) or _RC_TAP_STATE["key"] is None:
+        return
+    n = _RC_TAP_STATE["counts"].get(name, 0)
+    _RC_TAP_STATE["counts"][name] = n + 1
+    tag = f"{_RC_TAP_STATE['prefix']}{name}#{n}"
+    t = t.detach()
+    fkey = (_RC_TAP_STATE["key"], tag)
+    buf = _RC_TAP_FWD.get(fkey)
+    if not _RC_TAP_STATE["rc"]:
+        if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+            buf = torch.empty_like(t)
+            _RC_TAP_FWD[fkey] = buf
+        buf.copy_(t)
+        return
+    if buf is None or buf.shape != t.shape or buf.dtype != t.dtype:
+        _RC_TAP_NOFWD[tag] = _RC_TAP_NOFWD.get(tag, 0) + 1
+        return
+    if tag not in _RC_TAP_MAX:
+        _RC_TAP_MAX[tag] = torch.zeros((), dtype=torch.float32, device=t.device)
+        _RC_TAP_NEQ[tag] = torch.zeros((), dtype=torch.int64, device=t.device)
+        _RC_TAP_NUMEL[tag] = t.numel()
+    diff = (t.float() - buf.float()).abs().amax()
+    torch.maximum(_RC_TAP_MAX[tag], diff, out=_RC_TAP_MAX[tag])
+    _RC_TAP_NEQ[tag].add_((t != buf).sum())
+
+
+def _rc_tap_end() -> None:
+    if not _RC_TAP_ON:
+        return
+    _RC_TAP_STATE["key"] = None
+
+
+def _rc_tap_flush(iteration: int) -> None:
+    if not _RC_TAP_ON:
+        return
+    torch.cuda.synchronize()
+    try:
+        import torch.distributed as _dist
+
+        rank = _dist.get_rank() if _dist.is_initialized() else 0
+    except Exception:  # pragma: no cover
+        rank = 0
+    print(
+        f"[RCTAP] it={iteration} rank={rank} fwd_keys={len({k[0] for k in _RC_TAP_FWD})} "
+        f"fwd_bufs={len(_RC_TAP_FWD)}",
+        flush=True,
+    )
+    for tag in sorted(_RC_TAP_MAX):
+        print(
+            f"[RCTAP] it={iteration} rank={rank} tap={tag} maxabs={_RC_TAP_MAX[tag].item():.3e} "
+            f"neq={_RC_TAP_NEQ[tag].item()} numel={_RC_TAP_NUMEL[tag]} "
+            f"nofwd={_RC_TAP_NOFWD.get(tag, 0)}",
+            flush=True,
+        )
+        _RC_TAP_MAX[tag].zero_()
+        _RC_TAP_NEQ[tag].zero_()
+    for tag, cnt in _RC_TAP_NOFWD.items():
+        if tag not in _RC_TAP_MAX:
+            print(f"[RCTAP] it={iteration} rank={rank} tap={tag} nofwd={cnt}", flush=True)
+    _RC_TAP_NOFWD.clear()
+# TRACE (env MCORE_TRACE_DISPATCH=1): count post-capture dispatch entries split by grad state,
+# to see whether the FORWARD (grad off inside checkpoint) and the RECOMPUTE (grad on) reach the
+# graph replay dispatch at all. Resolves the chunk_full control flow empirically.
+_TRACE_G_ON = 0
+_TRACE_G_OFF = 0
+_TRACE_PRINTS = 0
+
+
+def _set_eager_recompute_active(value: bool) -> None:
+    """Toggle the eager-during-recompute probe (called by megatron.core.recompute)."""
+    global _MCORE_EAGER_RECOMPUTE_ACTIVE
+    _MCORE_EAGER_RECOMPUTE_ACTIVE = bool(value)
+
+
+def _get_eager_rc_hits() -> int:
+    """Return how many dispatch calls took the eager-return path (probe telemetry)."""
+    return _MCORE_EAGER_RC_HITS
 _IS_GRAPH_WARMUP = False
+_TCGD_CAPTURE_INDEX = 0
 logger = logging.getLogger(__name__)
+
+
+def _start_tcgd_capture_recording(config, num_microbatches, num_callables):
+    """Start an optional, rank-local allocator recording around TE capture."""
+    output_root = os.getenv('MCORE_TCGD_CAPTURE_DIR')
+    if not output_root:
+        return None
+
+    rank = torch.distributed.get_rank()
+    selected_ranks = {
+        int(value)
+        for value in os.getenv('MCORE_TCGD_CAPTURE_RANKS', '0').replace(',', ' ').split()
+    }
+    if rank not in selected_ranks:
+        return None
+
+    from torch_cudagraph_debug.memory_debug import MemoryRecorder
+
+    global _TCGD_CAPTURE_INDEX
+    capture_index = _TCGD_CAPTURE_INDEX
+    _TCGD_CAPTURE_INDEX += 1
+    os.makedirs(output_root, exist_ok=True)
+    bundle_dir = os.path.join(
+        output_root, f'capture-{capture_index:02d}-rank-{rank:05d}.tcgd-memory'
+    )
+    max_entries = int(os.getenv('MCORE_TCGD_HISTORY_MAX_ENTRIES', '500000'))
+    torch.cuda.memory._record_memory_history(
+        enabled='all',
+        context='all',
+        stacks='python',
+        max_entries=max_entries,
+        clear_history=True,
+    )
+    try:
+        recorder = MemoryRecorder(
+            name='te-chunk-capture',
+            rank=rank,
+            group_id=os.getenv('MCORE_TCGD_GROUP_ID', os.getenv('SLURM_JOB_ID', 'local')),
+            world_size=torch.distributed.get_world_size(),
+            devices=torch.cuda.current_device(),
+            bundle_dir=bundle_dir,
+            run_metadata={
+                'cuda_graph_granularity': config.cuda_graph_granularity,
+                'num_microbatches': num_microbatches,
+                'num_callables': num_callables,
+                'pipeline_rank': parallel_state.get_pipeline_model_parallel_rank(),
+                'virtual_pipeline_size': config.virtual_pipeline_model_parallel_size,
+                'history_max_entries': max_entries,
+            },
+        )
+        recorder.record_point('before_capture')
+        return recorder
+    except Exception:
+        torch.cuda.memory._record_memory_history(enabled=None)
+        raise
+
+
+def _finish_tcgd_capture_recording(recorder, capture_succeeded):
+    """Persist the optional capture recording and always disable history."""
+    if recorder is None:
+        return
+    try:
+        if capture_succeeded:
+            recorder.record_point('after_capture')
+            recorder.finish()
+    finally:
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
@@ -197,6 +454,141 @@ def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
 
     torch._C._cuda_endAllocateToPool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
     return out
+
+
+# Experiment (MCORE_GRAPH_EXTERNAL_POOL): MCore-owned graph pool handle passed to
+# TE make_graphed_callables so eager phases can borrow the pool's inactive
+# address space between replays (see _graph_pool_lend_ctx in training.py).
+_CHUNK_GRAPH_EXTERNAL_POOL_HANDLE = None
+
+
+def get_or_create_chunk_graph_external_pool():
+    """Create (once) and return the MCore-owned graph pool handle."""
+    global _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE
+    if _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE is None:
+        if os.environ.get('MCORE_GRAPH_UNIFY_POOL', '0') == '1':
+            # Experiment: share ONE pool between the chunk graphs and the full-iteration /
+            # optimizer-step graphs (OptimizerCudaGraphWrapper takes its pool from
+            # full_cuda_graph.get_shared_graph_pool()).
+            from megatron.core.full_cuda_graph import get_shared_graph_pool
+
+            _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE = get_shared_graph_pool()
+        else:
+            _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE = torch.cuda.graph_pool_handle()
+    return _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE
+
+
+def get_chunk_graph_external_pool():
+    """Return the MCore-owned graph pool handle, or None if not created."""
+    return _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE
+
+
+# Set True while _graph_pool_lend_ctx is actively routing this thread's
+# allocations into the external graph pool. pool_alloc_bypass() uses it to
+# temporarily divert an oversized allocation (e.g. the whole master-weight H2D
+# buffer, which cannot fit the pool's inactive space) back to the default pool.
+_CHUNK_GRAPH_POOL_LEND_ACTIVE = False
+# The compute stream that was current before _graph_pool_lend_ctx switched to
+# the capture stream. A spilled default-pool allocation MUST be made on this
+# stream: the caching allocator keys free blocks by home stream, so a default
+# allocation made on the capture stream cannot reuse compute-stream free blocks
+# and would grow the default pool by the full allocation size on every rank.
+_CHUNK_GRAPH_POOL_LEND_HOME_STREAM = None
+
+
+def set_chunk_graph_pool_lend_active(active, home_stream=None):
+    """Mark whether the current thread is routing allocations into the graph pool.
+
+    home_stream is the compute stream to restore for spilled default allocations.
+    """
+    global _CHUNK_GRAPH_POOL_LEND_ACTIVE, _CHUNK_GRAPH_POOL_LEND_HOME_STREAM
+    _CHUNK_GRAPH_POOL_LEND_ACTIVE = active
+    _CHUNK_GRAPH_POOL_LEND_HOME_STREAM = home_stream if active else None
+
+
+@contextmanager
+def pool_alloc_bypass():
+    """Route allocations made inside this block to the DEFAULT pool, on the
+    original compute stream, even when an outer graph-pool lending scope is active.
+
+    Used for allocations too large to ever fit the graph pool's inactive space
+    (whole master-weight H2D staging), so that lending them would only grow the
+    pinned private pool (never reclaimable) instead of reusing it. Restoring the
+    compute stream is required so the spilled allocation reuses existing
+    compute-stream default free blocks instead of growing the default pool.
+    """
+    if not _CHUNK_GRAPH_POOL_LEND_ACTIVE:
+        yield
+        return
+    handle = _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE
+    home_stream = _CHUNK_GRAPH_POOL_LEND_HOME_STREAM
+    device = torch.cuda.current_device()
+    torch._C._cuda_endAllocateToPool(device, handle)
+    stream_ctx = torch.cuda.stream(home_stream) if home_stream is not None else nullcontext()
+    stream_ctx.__enter__()
+    try:
+        yield
+    finally:
+        stream_ctx.__exit__(None, None, None)
+        torch._C._cuda_beginAllocateCurrentThreadToPool(device, handle)
+
+
+# Experiment (MCORE_GRAPH_POOL_LEND=postprocess): route every allocation made on the graph
+# capture stream during forward-backward into the chunk graph pool. The eager post-process of the
+# last pipeline stage (MTP block, LM head, cross entropy) is executed on the capture stream while
+# this is active (see HybridModel.forward), so its forward AND autograd-backward allocations reuse
+# the pool's inactive address space instead of the default pool. Stream-filtered routing is used
+# (not thread-filtered) because autograd runs the backward on its own thread.
+# NOTE: this is a MEMORY experiment. Under interleaved (VPP>1) schedules another microbatch's
+# forward replay can run between a post-process forward and its backward and overwrite lent
+# blocks (replay writes pool addresses unconditionally), so numerics of such runs are NOT valid.
+# The replay-safe realisation of the same memory layout is to capture the post-process as part of
+# the same `_order`-driven TE capture (see docs in the experiment notes).
+_POSTPROCESS_LEND_ACTIVE = False
+
+
+def postprocess_lend_active():
+    """True while forward-backward allocations on the capture stream are routed to the pool."""
+    return _POSTPROCESS_LEND_ACTIVE
+
+
+@contextmanager
+def postprocess_lend_forward_backward_ctx():
+    """Enable stream-routed lending of the graph pool for one forward-backward pass."""
+    global _POSTPROCESS_LEND_ACTIVE
+    phases = os.environ.get('MCORE_GRAPH_POOL_LEND', '')
+    pool = _CHUNK_GRAPH_EXTERNAL_POOL_HANDLE
+    capture_stream = torch.cuda.graphs.graph.default_capture_stream
+    if 'postprocess' not in phases.split(',') or pool is None or capture_stream is None:
+        yield
+        return
+    device = torch.cuda.current_device()
+    with torch.cuda.stream(capture_stream):
+        torch._C._cuda_beginAllocateCurrentStreamToPool(device, pool)
+    _POSTPROCESS_LEND_ACTIVE = True
+    try:
+        yield
+    finally:
+        _POSTPROCESS_LEND_ACTIVE = False
+        torch._C._cuda_endAllocateToPool(device, pool)
+
+
+@contextmanager
+def postprocess_lend_stream_ctx():
+    """Run the eager post-process on the graph capture stream while lending is active.
+
+    Free blocks of the graph pool are keyed by their home stream (the capture stream), so the
+    post-process can only reuse them if it allocates on that stream.
+    """
+    capture_stream = torch.cuda.graphs.graph.default_capture_stream
+    if not _POSTPROCESS_LEND_ACTIVE or capture_stream is None:
+        yield
+        return
+    compute_stream = torch.cuda.current_stream()
+    capture_stream.wait_stream(compute_stream)
+    with torch.cuda.stream(capture_stream):
+        yield
+    compute_stream.wait_stream(capture_stream)
 
 
 def tree_map(func, tree):
@@ -1073,30 +1465,42 @@ class _CudaGraphRunner(torch.nn.Module):
                     out_grad = o.cg_buffer_metadata.bwd_cudagraph_buffer
                     args_to_clear_buffers.append(o)
                     out_grad.cg_buffer_metadata.capture_reuse_count -= 1
+                    _bwd_meta_counts[0] += 1  # reuse branch (metadata present)
                 else:
                     out_grad = alloc_tensor_from_graph_mempool(o)
+                    _bwd_meta_counts[1] += 1  # fallback branch (metadata LOST -> jiemingz TODO)
             self.static_grad_outputs.append(out_grad)
+        if os.environ.get("MCORE_BWD_META_PROBE") == "1":
+            print(
+                f"[BWD_META] create_bwd_graph reuse={_bwd_meta_counts[0]} "
+                f"fallback(metadata_lost)={_bwd_meta_counts[1]}",
+                flush=True,
+            )
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
-            grad_inputs = torch.autograd.grad(
-                outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
-                inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
-                grad_outputs=tuple(o for o in self.static_grad_outputs if o is not None),
-                retain_graph=self.backward_retain_grad,
-                only_inputs=True,
-                allow_unused=True,
-            )
-            # Accumulate wgrads directly into main_grad inside the graph
-            n_act_grads = sum(
-                1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
-            )
-            for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
-                if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
-                    param.main_grad.add_(wgrad)
+        _set_in_bwd_capture(True)
+        try:
+            with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+                grad_inputs = torch.autograd.grad(
+                    outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
+                    inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
+                    grad_outputs=tuple(o for o in self.static_grad_outputs if o is not None),
+                    retain_graph=self.backward_retain_grad,
+                    only_inputs=True,
+                    allow_unused=True,
+                )
+                # Accumulate wgrads directly into main_grad inside the graph
+                n_act_grads = sum(
+                    1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
+                )
+                for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
+                    if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
+                        param.main_grad.add_(wgrad)
+        finally:
+            _set_in_bwd_capture(False)
 
         # Unfreeze GC.
         if FREEZE_GC:
@@ -1544,6 +1948,31 @@ class CudaGraphManager(torch.nn.Module):
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
         if _CudagraphGlobalRecord.cudagraph_created:
+            if os.environ.get("MCORE_TRACE_DISPATCH") == "1":
+                global _TRACE_G_ON, _TRACE_G_OFF, _TRACE_PRINTS
+                _grad_on = torch.is_grad_enabled()
+                if _grad_on:
+                    _TRACE_G_ON += 1
+                else:
+                    _TRACE_G_OFF += 1
+                if _TRACE_PRINTS < 10:
+                    _TRACE_PRINTS += 1
+                    print(
+                        f"[TRACE_DISPATCH] reached grad={_grad_on} g_on={_TRACE_G_ON} "
+                        f"g_off={_TRACE_G_OFF} mod={type(megatron_module).__name__} "
+                        f"eager_rc_active={_MCORE_EAGER_RECOMPUTE_ACTIVE}",
+                        flush=True,
+                    )
+            if _MCORE_EAGER_RECOMPUTE_ACTIVE:
+                # PROBE: inside the activation-checkpoint backward rerun -> run eager
+                # instead of re-replaying the graph (see _set_eager_recompute_active).
+                # The layer's backward then also runs eager (autograd), so no bwd graph
+                # is used for this call and the runner status is left untouched.
+                global _MCORE_EAGER_RC_HITS
+                _MCORE_EAGER_RC_HITS += 1
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
             if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
@@ -1860,6 +2289,23 @@ class TECudaGraphHelper:
                         chunk_with_decoder.decoder._te_cuda_graph_vp_stage = chunk_number
                         callables.append(chunk_with_decoder.decoder)
                         callables_is_mtp.append(False)
+                    # Experiment (MCORE_CG_CAPTURE_POSTPROCESS=1): the post-process (MTP, LM head,
+                    # loss) of the post_process chunk is one more callable of that chunk, captured
+                    # right after the decoder block in the same `_order` so it shares the pool.
+                    postprocess_block = getattr(chunk_with_decoder, 'postprocess_block', None)
+                    if (
+                        callables
+                        and postprocess_block is not None
+                        and getattr(chunk_with_decoder, 'post_process', False)
+                    ):
+                        postprocess_block._te_cuda_graph_vp_size = self.num_model_chunks
+                        postprocess_block._te_cuda_graph_vp_stage = chunk_number
+                        callables.append(postprocess_block)
+                        callables_is_mtp.append(False)
+                        logger.info(
+                            f'Rank {torch.distributed.get_rank()}: post-process block of model '
+                            f'chunk {chunk_number} added as a chunk CUDA graph callable.'
+                        )
                     num_graphable_layers = len(callables)
                 else:
                     if hasattr(chunk_with_decoder, 'mtp'):
@@ -2211,6 +2657,7 @@ class TECudaGraphHelper:
             mtp_layers = getattr(getattr(chunk_of_the_layer, "mtp", None), "layers", [])
             assert (
                 is_chunk_callable
+                or getattr(layer, 'is_cuda_graph_postprocess_callable', False)
                 or layer in chunk_of_the_layer.decoder.layers
                 or any(layer is mtp_layer.mtp_model_layer for mtp_layer in mtp_layers)
             ), "Layer is not in the chunk"
@@ -2668,6 +3115,22 @@ class TECudaGraphHelper:
                 # graph backend may crash if use the auto_num_slots.
                 self.num_microbatches = max(runtime_num_microbatches, max_num_microbatches)
                 fallback_reason = None
+                # EXPERIMENT (MCORE_CG_FORCE_SLOTS): probe whether graph-slot count can be
+                # reduced from Nmax to max-inflight (auto_num_slots). Capture completes before
+                # any replay, so pool bytes are measurable even if replay later index-crashes.
+                _force = os.environ.get('MCORE_CG_FORCE_SLOTS', '')
+                if _force == 'auto':
+                    self.num_microbatches = auto_num_slots
+                elif _force == 'runtime':
+                    self.num_microbatches = runtime_num_microbatches
+                elif _force.isdigit():
+                    self.num_microbatches = int(_force)
+                if _force:
+                    fallback_reason = f'FORCED_SLOTS={_force}'
+            # Stash for the capture-time memory probe log in create_cudagraphs().
+            self._dbg_slot_auto = auto_num_slots
+            self._dbg_slot_nmax = max_num_microbatches
+            self._dbg_slot_runtime = runtime_num_microbatches
             log_on_each_pipeline_stage(
                 logger=logger,
                 tp_group=None,
@@ -2772,7 +3235,14 @@ class TECudaGraphHelper:
                 # window, so the reuse is safe with the arena;
                 # _validate_mhc_static_hidden_inputs() enforces the window-disjointness
                 # invariant after capture.
-                kwargs['_reuse_graph_input_output_buffers'] = True
+                # EXPERIMENT (MCORE_CG_NO_BUFFER_REUSE): the reuse aliasing is keyed to the
+                # capture ``_order``. When slots are reduced to auto_num_slots and replayed
+                # in a ring over MORE runtime microbatches, that liveness no longer matches,
+                # so a weak-ref'd buffer can be reallocated while a graph still uses it
+                # (illegal memory access). Disable to test whether the reuse is the blocker.
+                kwargs['_reuse_graph_input_output_buffers'] = (
+                    os.environ.get('MCORE_CG_NO_BUFFER_REUSE', '0') != '1'
+                )
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
@@ -2919,13 +3389,46 @@ class TECudaGraphHelper:
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
+            if os.environ.get('MCORE_GRAPH_EXTERNAL_POOL', '0') == '1':
+                kwargs['pool'] = get_or_create_chunk_graph_external_pool()
+                logger.info(
+                    'TECudaGraphHelper: capturing into MCore-owned external graph pool %s',
+                    kwargs['pool'],
+                )
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
+            tcgd_recorder = _start_tcgd_capture_recording(
+                self.config, self.num_microbatches, len(self.flattened_callables)
+            )
+            capture_succeeded = False
+            _probe = os.environ.get('MCORE_CG_SLOT_PROBE', '0') == '1'
+            if _probe:
+                torch.cuda.synchronize()
+                _resv_before = torch.cuda.memory_reserved()
+                _alloc_before = torch.cuda.memory_allocated()
+            try:
+                with rng_context:
+                    graphs = make_graphed_callables(
+                        tuple(self.flattened_callables), sample_args, **kwargs
+                    )
+                capture_succeeded = True
+            finally:
+                _finish_tcgd_capture_recording(tcgd_recorder, capture_succeeded)
+            if _probe:
+                torch.cuda.synchronize()
+                _resv_after = torch.cuda.memory_reserved()
+                _alloc_after = torch.cuda.memory_allocated()
+                logger.info(
+                    'SLOT_PROBE rank=%d slots=%d auto=%s nmax=%s runtime=%s '
+                    'callables=%d resv_before=%d resv_after=%d resv_delta=%d '
+                    'alloc_before=%d alloc_after=%d alloc_delta=%d',
+                    torch.distributed.get_rank(), self.num_microbatches,
+                    getattr(self, '_dbg_slot_auto', None), getattr(self, '_dbg_slot_nmax', None),
+                    getattr(self, '_dbg_slot_runtime', None), len(self.flattened_callables),
+                    _resv_before, _resv_after, _resv_after - _resv_before,
+                    _alloc_before, _alloc_after, _alloc_after - _alloc_before,
                 )
             self._validate_mhc_static_hidden_inputs(sample_args)
 
@@ -3170,6 +3673,8 @@ def set_current_microbatch(model, microbatch_id):
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
                 layer.mtp_model_layer.current_microbatch = microbatch_id
+        if getattr(model_with_decoder, 'postprocess_block', None) is not None:
+            model_with_decoder.postprocess_block.current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

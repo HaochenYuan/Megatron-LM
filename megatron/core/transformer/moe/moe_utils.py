@@ -1231,22 +1231,32 @@ class RandomSTE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, logits: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, logits: torch.Tensor, stash_id=None) -> torch.Tensor:
         """
         Forward pass returns random logits with rank-specific seed.
 
         Args:
             logits (torch.Tensor): The logits.
+            stash_id: Call-site id used to replay the forward's draw in a checkpoint recompute.
 
         Returns:
             torch.Tensor: The random logits.
         """
+        from megatron.core.transformer.recompute_window import (
+            hash_normal,
+            recompute_consistent_seed,
+        )
+
+        # Draw a rank-specific seed from the EP RNG stream and expand it deterministically to the
+        # random logits. Inside an activation-checkpoint window the recompute replays the forward's
+        # seed (16 bytes) instead of re-drawing: RNG-state restore does not reproduce the draw with
+        # graph-safe RNG states or under CUDA graphs, and stashing the full logits does not scale.
         with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
-            random_logits = logits.clone().normal_()
-        return random_logits
+            seed = recompute_consistent_seed(("moe_random_logits", stash_id), logits.device)
+        return hash_normal(seed, logits.shape, logits.dtype)
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, grad_output: torch.Tensor):
         """
         Backward pass propagates the gradient for logits.
 
@@ -1256,20 +1266,22 @@ class RandomSTE(torch.autograd.Function):
         Returns:
             torch.Tensor: The gradient input.
         """
-        return grad_output
+        return grad_output, None
 
 
-def apply_random_logits(logits: torch.Tensor) -> torch.Tensor:
+def apply_random_logits(logits: torch.Tensor, stash_id=None) -> torch.Tensor:
     """
     Apply the RandomSTE function to the logits.
 
     Args:
         logits (torch.Tensor): The logits.
+        stash_id: Identifies the call site (e.g. layer number) so that an activation
+            checkpoint recompute replays the forward's random draw for this site.
 
     Returns:
         torch.Tensor: The random logits.
     """
-    return RandomSTE.apply(logits)
+    return RandomSTE.apply(logits, stash_id)
 
 
 @internal_api
@@ -1289,11 +1301,17 @@ class RandomSTEShared(torch.autograd.Function):
         if std < 0 and layer_number in RandomSTEShared._cache:
             return logits + RandomSTEShared._cache[layer_number]
 
-        # Generate random bias with shared seed across all ranks
-        with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
-            bias = torch.empty(logits.shape[-1], device=logits.device, dtype=logits.dtype).normal_(
-                std=abs(std)
-            )
+        # Generate random bias with shared seed across all ranks. Inside an activation
+        # checkpoint window the recompute replays the forward's draw.
+        from megatron.core.transformer.recompute_window import recompute_consistent_random
+
+        def _draw():
+            with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+                return torch.empty(
+                    logits.shape[-1], device=logits.device, dtype=logits.dtype
+                ).normal_(std=abs(std))
+
+        bias = recompute_consistent_random(("moe_biased_logits", layer_number), _draw)
 
         # Cache if reuse mode
         if std < 0 and layer_number is not None:
@@ -1317,7 +1335,7 @@ def apply_biased_logits(logits, std, layer_number=None):
              per layer and reuse (using abs(std) as actual std).
         layer_number: Layer number for caching when std is negative.
     """
-    logits = apply_random_logits(logits)
+    logits = apply_random_logits(logits, stash_id=layer_number)
     return RandomSTEShared.apply(logits, std, layer_number)
 
 

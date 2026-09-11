@@ -32,8 +32,8 @@ def start_memory_history_recording(profiling: ProfilingConfig | None) -> None:
 
     torch.cuda.memory._record_memory_history(
         True,
-        # Retain up to 100k alloc/free events.
-        trace_alloc_max_entries=100_000,
+        # A memory-overhead study can raise this without changing normal profiling.
+        trace_alloc_max_entries=int(os.getenv("MCORE_MEMORY_HISTORY_MAX_ENTRIES", "100000")),
         # Record the Python stack at each event — lets memory_viz show call sites.
         trace_alloc_record_context=True,
     )

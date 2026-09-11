@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -2036,14 +2037,22 @@ class DSAttention(MegatronModule):
                 ].contiguous()
 
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("DSA_fwd")
         x = x.detach()
         qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         computes_topk = not self.skip_topk
-        use_indexer_loss = (
-            self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
+        # The no_grad forward of an activation checkpoint must take the same (training) indexer
+        # path as its recompute, otherwise the recompute is a different function than the loss's.
+        from megatron.core.transformer.recompute_window import checkpoint_forward_uses_training_path
+
+        _train_active = self.training and (
+            torch.is_grad_enabled() or checkpoint_forward_uses_training_path()
         )
+        use_indexer_loss = _train_active and indexer_loss_coeff > 0 and computes_topk
         if use_indexer_loss and sequence_parallel_query_is_local:
             raise RuntimeError(
                 "DSA indexer loss requires TP ranks to own the same query rows; "
@@ -2126,6 +2135,9 @@ class DSAttention(MegatronModule):
             topk_indices = topk_holder[self.source_layer]
             if topk_length_holder is not None:
                 topk_length = topk_length_holder.get(self.source_layer)
+            from megatron.core.transformer.cuda_graphs import _rc_tap
+
+            _rc_tap("DSA_topk_shared", topk_indices)  # RC TAP: index-share consumer
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
@@ -2221,7 +2233,7 @@ class DSAttention(MegatronModule):
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
-            if use_indexer_loss:
+            if use_indexer_loss and torch.is_grad_enabled():
                 if indexer_loss is None:
                     raise RuntimeError("Fused DSA attention did not produce a valid indexer loss.")
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -2313,7 +2325,7 @@ class DSAttention(MegatronModule):
             # under sequence-local TP query shards, so the top-k rows are already global.
 
             # Save indexer loss for logging.
-            if indexer_loss_coeff > 0:
+            if indexer_loss_coeff > 0 and torch.is_grad_enabled():
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
@@ -2374,6 +2386,10 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+        if computes_topk:
+            from megatron.core.transformer.cuda_graphs import _rc_tap
+
+            _rc_tap("DSA_topk_comp", topk_indices)  # RC TAP: index-share producer / own top-k
 
         # ===================================
         # Run sparse attention kernel
@@ -2393,6 +2409,9 @@ class DSAttention(MegatronModule):
             varlen_ends=varlen_ends,
             key_positions=key_positions,
         )
+        from megatron.core.transformer.cuda_graphs import _rc_tap as _rc_tap_out
+
+        _rc_tap_out("DSA_out", output)  # RC TAP: sparse-attention output
 
         if use_indexer_loss:
             if indexer_loss is None:

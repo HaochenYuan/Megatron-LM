@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
+
+import torch
+from collections import OrderedDict
 from typing import Literal, Optional
 
 from torch import Tensor
@@ -21,7 +25,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -51,6 +57,129 @@ def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
     if tp_group is None:
         return {}
     return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
+
+class HybridPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
+    """Experiment (MCORE_CG_CAPTURE_POSTPROCESS=1): make the last stage's post-process (MTP block,
+    LM head, cross entropy) a TE chunk-graph callable so it is captured in the same `_order`-driven
+    capture as the decoder chunks and therefore shares (and reuses, replay-safely) the chunk graph
+    memory pool instead of running eagerly from the default pool.
+
+    The module owns no parameters of its own; it registers the model's ``mtp``/``output_layer``/
+    ``embedding`` as shared children so TE sees their parameters as part of the callable. State
+    dicts are suppressed so the shared parameters are not serialized twice.
+    """
+
+    is_cuda_graph_postprocess_callable = True
+
+    def __init__(self, model):
+        super().__init__(config=model.config)
+        object.__setattr__(self, '_owner', model)  # plain reference, not a registered child
+        if getattr(model, 'mtp', None) is not None:
+            self.mtp = model.mtp
+        self.output_layer = model.output_layer
+        if getattr(model, 'embedding', None) is not None:
+            self.embedding = model.embedding
+        self.pre_process = False
+        self.post_process = True
+        self.input_tensor = None
+        self._initialize_chunk_cuda_graph_support()
+
+    # -- do not serialize the shared parameters a second time -----------------------------------
+    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+        if destination is None:
+            destination = OrderedDict()
+        return destination
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        return {}
+
+    # -- static capture inputs --------------------------------------------------------------------
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        cfg = self.config
+        device = torch.cuda.current_device()
+        assert self._is_thd_cuda_graph(), "post-process capture is implemented for THD chunk graphs"
+        dtype = torch.bfloat16 if cfg.bf16 else (torch.float16 if cfg.fp16 else torch.float32)
+        tokens = cfg.max_seqlen_per_dp_cp_rank
+        inputs = {
+            "hidden_states": torch.ones(
+                (tokens, 1, cfg.hidden_size), dtype=dtype, requires_grad=True, device=device
+            )
+        }
+        owner = self._owner
+        if cfg.enable_hyper_connections and (cfg.mtp_num_layers or 0) > 0 and owner.mtp_process:
+            inputs["mhc_multistream"] = torch.ones(
+                (tokens, 1, cfg.hidden_size * cfg.num_residual_streams),
+                dtype=dtype,
+                requires_grad=True,
+                device=device,
+            )
+        inputs["input_ids"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
+        inputs["position_ids"] = torch.arange(tokens, dtype=torch.long, device=device).unsqueeze(0)
+        inputs["labels"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
+        inputs["loss_mask"] = torch.ones((1, tokens), dtype=torch.float32, device=device)
+        max_num_seqs = cfg.thd_max_packed_sequences
+        assert max_num_seqs is not None, "thd_max_packed_sequences must be set for THD chunk graphs."
+        max_tokens = tokens * cfg.context_parallel_size
+        cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
+        cu_seqlens[1:] = max_tokens
+        inputs.update(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens.clone(),
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+        )
+        inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
+        return inputs
+
+    # -- TE callable protocol ---------------------------------------------------------------------
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        kwargs = kwargs.copy()
+        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        kwargs.setdefault('attention_mask', None)
+        return self.forward(*args, **kwargs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        self._decompose_packed_seq_params_to_kwargs(kwargs)
+        microbatch_id = getattr(self, 'current_microbatch', 0)
+        assert microbatch_id < len(self.cuda_graphs), (
+            f"post-process CUDA graph replay requested microbatch {microbatch_id}, but capture "
+            f"only contains {len(self.cuda_graphs)} graphs."
+        )
+        return GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
+
+    def forward(
+        self,
+        hidden_states,
+        mhc_multistream=None,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        attention_mask=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        rotary_pos_emb=None,
+        **_ignored,
+    ):
+        return self._owner._postprocess_after_decoder(
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            inference_context=None,
+            inference_params=None,
+            runtime_gather_output=None,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            in_inference_mode=False,
+        )
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -150,6 +279,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.position_embedding_type = position_embedding_type
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
+        self.fuse_linear_cross_entropy = (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        )
 
         # Backward compatibility for deprecated hybrid parameters
         if hybrid_override_pattern is not None:
@@ -308,7 +441,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Output
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            output_layer_cls = (
+                LinearCrossEntropyModule
+                if self.fuse_linear_cross_entropy
+                else tensor_parallel.ColumnParallelLinear
+            )
+            self.output_layer = output_layer_cls(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -332,6 +470,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+        # Experiment (MCORE_CG_CAPTURE_POSTPROCESS=1): graph the post-process with the chunk graphs.
+        self.postprocess_block = None
+        if (
+            self.post_process
+            and self.config.cuda_graph_impl == "transformer_engine"
+            and getattr(self.config, 'cuda_graph_granularity', 'layer') == 'chunk'
+            and os.environ.get('MCORE_CG_CAPTURE_POSTPROCESS', '0') == '1'
+        ):
+            self.postprocess_block = HybridPostProcessBlock(self)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -544,6 +692,63 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hidden_states = decoder_output
             mhc_multistream = None
 
+        # Experiment (MCORE_GRAPH_POOL_LEND=postprocess): run the eager post-process (MTP, LM head,
+        # loss) on the graph capture stream so its allocations are lent from the chunk graph pool.
+        from megatron.core.transformer.cuda_graphs import postprocess_lend_stream_ctx
+
+        if self.postprocess_block is not None and self.training and not in_inference_mode:
+            # Graphable post-process callable (captured into / replayed from the chunk graph pool).
+            return self.postprocess_block(
+                hidden_states,
+                mhc_multistream=mhc_multistream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                rotary_pos_emb=rotary_pos_emb,
+            )
+
+        with postprocess_lend_stream_ctx():
+            return self._postprocess_after_decoder(
+                hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                inference_context=inference_context,
+                inference_params=inference_params,
+                runtime_gather_output=runtime_gather_output,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                in_inference_mode=in_inference_mode,
+            )
+
+    def _postprocess_after_decoder(
+        self,
+        *,
+        hidden_states,
+        mhc_multistream,
+        input_ids,
+        position_ids,
+        attention_mask,
+        labels,
+        loss_mask,
+        inference_context,
+        inference_params,
+        runtime_gather_output,
+        packed_seq_params,
+        padding_mask,
+        rotary_pos_emb,
+        in_inference_mode,
+    ):
+        """MTP block, LM head and loss (everything after the decoder). Split out of forward so the
+        experiment above can run it on a different stream; body unchanged."""
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
@@ -651,10 +856,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-        logits = self._scale_logits(logits)
+        if labels is None:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
+            logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:
@@ -669,6 +875,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        if self.fuse_linear_cross_entropy:
+            loss = self.output_layer(
+                output_cross_entropy_loss=True,
+                labels=labels,
+                **output_layer_kwargs,
+            )
+        else:
+            logits, _ = self.output_layer(**output_layer_kwargs)
+            logits = self._scale_logits(logits)
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss

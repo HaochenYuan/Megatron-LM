@@ -203,6 +203,26 @@ class ChunkCudaGraphBlockMixin:
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay graph ``microbatch_id`` from the Nmax chunk capture."""
+        import os as _os
+
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("B_te_replay")
+
+        if _os.environ.get("MCORE_TRACE_DISPATCH") == "1":
+            import torch as _torch
+
+            from megatron.core.transformer.cuda_graphs import _get_in_recompute
+
+            cls = type(self)._TRACE_REPLAY_COUNT = getattr(type(self), "_TRACE_REPLAY_COUNT", 0) + 1
+            if type(self)._TRACE_REPLAY_COUNT <= 16:
+                print(
+                    f"[TRACE_REPLAY] _te_cuda_graph_replay grad={_torch.is_grad_enabled()} "
+                    f"in_recompute={_get_in_recompute()} "
+                    f"gran={getattr(self.config, 'cuda_graph_granularity', 'layer')} "
+                    f"mb={getattr(self, 'current_microbatch', 0)} n={type(self)._TRACE_REPLAY_COUNT}",
+                    flush=True,
+                )
         if getattr(self.config, 'cuda_graph_granularity', 'layer') != "chunk":
             return super()._te_cuda_graph_replay(*args, **kwargs)
 
@@ -215,10 +235,26 @@ class ChunkCudaGraphBlockMixin:
         pp_single_graph_replay = (
             self.config.pipeline_model_parallel_size == 1 and len(self.cuda_graphs) == 1
         )
-        assert microbatch_id >= 0 and (
-            pp_single_graph_replay or microbatch_id < len(self.cuda_graphs)
-        ), (
-            f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but capture only "
-            f"contains Nmax={len(self.cuda_graphs)} graphs."
-        )
+        # EXPERIMENT (MCORE_CG_RING_REPLAY): when the capture is intentionally reduced
+        # to auto_num_slots (= max in-flight microbatches) instead of Nmax, replay must
+        # ring-index into the smaller graph list. The base _te_cuda_graph_replay
+        # (module.py) already does ``current_microbatch % len(self.cuda_graphs)`` for the
+        # graph, static hidden input, and backward_dw, so the only 1:1 gate is this
+        # assert. Ring reuse is correct iff len(cuda_graphs) >= max in-flight, which is
+        # exactly what capping at auto_num_slots guarantees (the microbatch that last
+        # used slot s = microbatch_id-len has already retired its backward).
+        import os as _os
+        _ring = _os.environ.get('MCORE_CG_RING_REPLAY', '0') == '1'
+        if _ring:
+            assert microbatch_id >= 0 and len(self.cuda_graphs) >= 1, (
+                f"Chunk CUDA graph ring replay: bad microbatch {microbatch_id} / "
+                f"{len(self.cuda_graphs)} graphs."
+            )
+        else:
+            assert microbatch_id >= 0 and (
+                pp_single_graph_replay or microbatch_id < len(self.cuda_graphs)
+            ), (
+                f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but capture only "
+                f"contains Nmax={len(self.cuda_graphs)} graphs."
+            )
         return super()._te_cuda_graph_replay(*args, **kwargs)

@@ -114,6 +114,9 @@ class RecomputeSegment:
             "layer-level full recompute requires the retained segment input tensor, "
             "but it is missing."
         )
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit, _rcflow_set_seg
+
+        _rcflow_hit("SEG_recompute")
         cs = self.chunk_state
 
         for name, value in self.state_snapshot.items():
@@ -138,14 +141,18 @@ class RecomputeSegment:
             seg_layer.set_forward_no_grad(False)
 
         # Replay the forward RNG stream so rng-forked ops reproduce the initial forward.
-        with _fork_rng():
-            _set_all_rng_states(*self.rng_states)
-            f_input = segment_input
-            for i, seg_layer in enumerate(self.layers):
-                nvtx_msg = f"recompute_layer_{self.start_index + i}"
-                nvtx_range_push(nvtx_msg)
-                f_input = seg_layer.recompute_forward(f_input)
-                nvtx_range_pop(nvtx_msg)
+        _rcflow_set_seg(True)
+        try:
+            with _fork_rng():
+                _set_all_rng_states(*self.rng_states)
+                f_input = segment_input
+                for i, seg_layer in enumerate(self.layers):
+                    nvtx_msg = f"recompute_layer_{self.start_index + i}"
+                    nvtx_range_push(nvtx_msg)
+                    f_input = seg_layer.recompute_forward(f_input)
+                    nvtx_range_pop(nvtx_msg)
+        finally:
+            _rcflow_set_seg(False)
         self.rng_states = None
 
         # This replay re-produced the bridge leaf: hand it the parked gradient.
@@ -460,6 +467,9 @@ class TransformerLayerSchedulePlan:
 
         One fp8 context per node, matching run()'s forward half node for node.
         """
+        from megatron.core.transformer.cuda_graphs import _rcflow_hit
+
+        _rcflow_hit("SEG_recompute_forward")
         for node in self._iter_layer_nodes():
             with self.get_fp8_context():
                 f_input = node.forward(f_input)

@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
 from contextlib import nullcontext
 from typing import List, Optional, Set, Tuple, Union
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -11,6 +13,8 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
+
+_EAGER_RC_PRINTS = 0  # rate-limit for the MCORE_EAGER_RECOMPUTE probe telemetry
 
 te_checkpoint = None
 
@@ -51,10 +55,44 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
+    # Lazy import to avoid a circular dependency (hybrid_block imports this module).
+    # HyperConnectionHybridLayer is NOT a TransformerLayer subclass, so it must be
+    # handled explicitly below: it accepts input_ids/padding_mask (needed by hash-MoE
+    # routing) but not the cross-attention context/attention_bias kwargs.
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+    except Exception:  # pragma: no cover - hybrid model not always importable
+        HyperConnectionHybridLayer = ()
+
     def custom(start: int, end: int):
         def custom_forward(
             hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
         ):
+            # PROBE (env MCORE_EAGER_RECOMPUTE=1): grad is enabled here ONLY during the
+            # activation-checkpoint backward RERUN (te_checkpoint runs the forward under
+            # no_grad, the recompute under enable_grad). Flag the cuda-graph dispatch to
+            # run EAGER during this recompute so the graph is NOT re-replayed in backward.
+            _in_rc = torch.is_grad_enabled()  # True only during the checkpoint backward rerun
+            from megatron.core.transformer.cuda_graphs import _rcflow_hit, _set_in_recompute
+
+            _rcflow_hit("RCPY_custom_fwd")
+
+            _set_in_recompute(_in_rc)
+            # RC TAP (MCORE_RC_TAP=1): pair this forward/recompute window by the checkpoint
+            # input address and tap the inputs the recompute must reproduce exactly.
+            from megatron.core.transformer.cuda_graphs import _rc_tap, _rc_tap_begin, _rc_tap_end
+
+            _rc_tap_begin(hidden_states, prefix=f"c{start}{end}.")
+            _rc_tap("IN", hidden_states)
+            _rc_tap("AUX_cu_q", getattr(packed_seq_params, "cu_seqlens_q", None))
+            _rc_tap("AUX_cu_kv", getattr(packed_seq_params, "cu_seqlens_kv", None))
+            _rc_tap("AUX_pad", padding_mask)
+            _rc_tap("AUX_ids", input_ids)
+            _eager_rc = os.environ.get("MCORE_EAGER_RECOMPUTE", "0") == "1" and _in_rc
+            if _eager_rc:
+                from megatron.core.transformer.cuda_graphs import _set_eager_recompute_active
+
+                _set_eager_recompute_active(True)
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
@@ -94,6 +132,16 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
+                    elif HyperConnectionHybridLayer and isinstance(
+                        layer, HyperConnectionHybridLayer
+                    ):
+                        # mHC layer wraps a TransformerLayer: it threads input_ids
+                        # (required for hash-MoE routing) and padding_mask, but does
+                        # not accept the cross-attention context kwargs. Popping only
+                        # those keeps input_ids alive through full recompute.
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
+                        hidden_states, context = layer(**layer_kwargs)
                     else:  # MambaLayer (HybridStack `M` slot)
                         for k in (
                             "context",
@@ -109,12 +157,43 @@ def checkpointed_forward(
                 # Some layer paths may still return a tuple (defensive).
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+                _rc_tap(f"L{index}", hidden_states)
+            _rc_tap_end()
+            from megatron.core.transformer.cuda_graphs import _set_in_recompute as _clr_in_rc
+
+            _clr_in_rc(False)
+            if _eager_rc:
+                from megatron.core.transformer.cuda_graphs import (
+                    _get_eager_rc_hits,
+                    _set_eager_recompute_active,
+                )
+
+                _set_eager_recompute_active(False)
+                global _EAGER_RC_PRINTS
+                if _EAGER_RC_PRINTS < 4:
+                    _EAGER_RC_PRINTS += 1
+                    print(
+                        f"[EAGER_RC_PROBE] recompute chunk [{start},{end}) ran eager; "
+                        f"cumulative eager-return hits={_get_eager_rc_hits()}",
+                        flush=True,
+                    )
             return hidden_states, context
 
         return custom_forward
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
+        # M2 PROBE (env MCORE_RC_CLONE_INPUT=1, default off/inert): the activation
+        # checkpoint saves this chunk's INPUT `hidden_states` and re-supplies it at
+        # recompute time. If that input aliases a CUDA-graph static buffer (the prior
+        # chunk-graph block's captured output), a later graph replay -- including the
+        # backward recompute itself -- can clobber the address, so the recompute reads
+        # a DIFFERENT input than the forward did ("input not preserved"). Cloning forces
+        # the checkpoint to save a private copy. If this closes the chunk+full mHC
+        # divergence, the cause is input aliasing (M2); if not, it is the aggregate
+        # OUTPUT address (M1, needs the mHC arena direct-write).
+        if use_checkpoint and os.environ.get("MCORE_RC_CLONE_INPUT", "0") == "1":
+            hidden_states = hidden_states.clone()
         cf = custom(start, end)
         args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
         if use_checkpoint:
