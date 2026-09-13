@@ -110,6 +110,14 @@ def checkpoint_window(forward_func: Callable) -> Callable:
     """
 
     def _wrapped(*args, **kwargs):
+        # The recompute runs on the autograd engine's worker thread. Kernel runtimes that launch
+        # through the CUDA driver directly (cuTile in the fused mHC kernels) need a *current*
+        # CUDA context on that thread; torch only makes one current lazily on its own ops, so a
+        # cuTile launch as the first CUDA call on the thread fails with "invalid device context".
+        for arg in args:
+            if torch.is_tensor(arg) and arg.is_cuda:
+                torch.cuda.set_device(arg.device)
+                break
         pushed = push_recompute_window(args, torch.is_grad_enabled())
         try:
             return forward_func(*args, **kwargs)

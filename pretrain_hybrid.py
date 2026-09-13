@@ -448,6 +448,33 @@ if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
 
+    # DIAG (env-gated, default off): periodic all-thread Python stack dumps per rank, for hang
+    # localisation at scale (MCORE_HANG_DUMP_SEC=<interval s>, MCORE_HANG_DUMP_DIR=<dir>).
+    if int(os.environ.get("MCORE_HANG_DUMP_SEC", "0") or 0) > 0:
+        import faulthandler as _fh
+
+        _dump_dir = os.environ.get("MCORE_HANG_DUMP_DIR", ".")
+        os.makedirs(_dump_dir, exist_ok=True)
+        _dump_file = open(
+            os.path.join(_dump_dir, f"stacks_rank{os.environ.get('RANK', '0')}.txt"), "a"
+        )
+        _fh.dump_traceback_later(
+            int(os.environ["MCORE_HANG_DUMP_SEC"]), repeat=True, file=_dump_file
+        )
+    # DIAG (env-gated, default off): on-demand dump of all thread stacks on SIGUSR1 (sent by the launcher's
+    # stall watchdog). Periodic dumps (above) can segfault a rank whose Triton/launch threads are mid-frame
+    # (seen on job 7105163), so prefer this one-shot variant for hang localisation.
+    if os.environ.get("MCORE_HANG_DUMP_SIGNAL", "0") == "1":
+        import faulthandler as _fh
+        import signal as _signal
+
+        _dump_dir = os.environ.get("MCORE_HANG_DUMP_DIR", ".")
+        os.makedirs(_dump_dir, exist_ok=True)
+        _sig_file = open(
+            os.path.join(_dump_dir, f"stacks_rank{os.environ.get('RANK', '0')}.txt"), "a"
+        )
+        _fh.register(_signal.SIGUSR1, file=_sig_file, all_threads=True, chain=False)
+
     # Register startup timestamps for timing report in pretrain()
     set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 

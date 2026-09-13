@@ -5233,6 +5233,18 @@ def get_train_valid_test_num_samples():
     # Number of train/valid/test samples.
     if args.train_samples:
         train_samples = args.train_samples
+    elif args.step_batch_size_schedule is not None:
+        # Iteration-based training with a step batch-size schedule: args.global_batch_size is only
+        # the mbs*DP default here, so size the dataset for the largest batch in the schedule;
+        # otherwise the sampler runs dry at the first step-up (StopIteration in data_schedule).
+        from megatron.core.num_microbatches_calculator import get_max_num_microbatches
+
+        train_samples = (
+            args.train_iters
+            * get_max_num_microbatches()
+            * args.micro_batch_size
+            * mpu.get_data_parallel_world_size()
+        )
     else:
         train_samples = args.train_iters * args.global_batch_size
     if args.full_validation:

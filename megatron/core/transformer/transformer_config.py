@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 import inspect
 import logging
 import math
@@ -344,6 +345,9 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
     dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
     """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
@@ -769,6 +773,17 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    """
+
+    moe_megakernel_backend: Optional[str] = None
+    """Optional backend that replaces MoE dispatch, expert computation, and combine.
+    Supported values: None and "mok".
+    """
+
+    moe_megakernel_backend_config: Optional[dict] = None
+    """Backend options for moe_megakernel_backend.
+
+    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -1758,6 +1773,11 @@ class TransformerConfig(ModelParallelConfig):
                     "cp_comm_type=allgather only."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}"
+                )
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
             mtp_layers = self.mtp_num_layers or 0
@@ -1780,6 +1800,12 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
+            uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+            indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+            uses_mxfp8_indexer = uses_ratio4_indexer and self.dsa_indexer_precision == "mxfp8"
+            if uses_mxfp8_indexer and self.dsa_kernel_backend != "cudnn":
+                raise ValueError("MXFP8 DSA indexer precision requires dsa_kernel_backend='cudnn'")
+
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
                     "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
@@ -1793,8 +1819,20 @@ class TransformerConfig(ModelParallelConfig):
                     f"dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
-                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
-                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if uses_mxfp8_indexer:
+                    if sm[0] < 10:
+                        raise ValueError("MXFP8 compact DSA indexer requires SM100 or later")
+                    if self.dsa_indexer_n_heads != 64 or self.dsa_indexer_head_dim != 128:
+                        raise ValueError(
+                            "MXFP8 compact DSA indexer requires dsa_indexer_n_heads=64 and "
+                            "dsa_indexer_head_dim=128"
+                        )
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        raise ValueError(
+                            "MXFP8 DSA indexer loss supports only sparse loss; set "
+                            "dsa_indexer_use_sparse_loss=True"
+                        )
+
                 if (
                     sm[0] == 9
                     and uses_ratio4_indexer
@@ -1808,6 +1846,33 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
                 from cudnn import DSA
+
+                if sm[0] >= 10 and uses_ratio4_indexer:
+                    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+                    required_parameters = {"deterministic"}
+                    if uses_mxfp8_indexer:
+                        required_parameters.update(
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
+                        )
+                    wrapper_parameters = (
+                        set(inspect.signature(compact_wrapper).parameters)
+                        if callable(compact_wrapper)
+                        else set()
+                    )
+                    missing_parameters = required_parameters - wrapper_parameters
+                    if missing_parameters:
+                        raise ValueError(
+                            "Fused DSA indexer requires a compatible cuDNN Frontend compact "
+                            "wrapper; "
+                            f"missing parameters: {', '.join(sorted(missing_parameters))}"
+                        )
 
                 if (
                     self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -3094,6 +3159,86 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        # ---- MoE megakernel backend (MOK, upstream #6572) -------------------------------------
+        if self.moe_megakernel_backend not in (None, "mok"):
+            raise ValueError(
+                "moe_megakernel_backend must be None or 'mok', got "
+                f"{self.moe_megakernel_backend!r}"
+            )
+        if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
+            raise ValueError(
+                "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
+            )
+        if self.moe_megakernel_backend == "mok":
+            if not self.gradient_accumulation_fusion:
+                raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
+            if not self.moe_grouped_gemm:
+                raise ValueError("MOK currently requires moe_grouped_gemm=True")
+            mok_bf16 = (
+                self.bf16
+                and not self.fp16
+                and self.fp8 is None
+                and not self.fp8_param
+                and getattr(self, "fp4", None) is None
+                and not getattr(self, "fp4_param", False)
+            )
+            mok_mxfp8 = (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            )
+            if not (mok_bf16 or mok_mxfp8):
+                raise ValueError(
+                    "MOK routed experts require either bf16=True with no FP8/FP4 mode, "
+                    "or MXFP8 with fp8_param=True; FP32, FP16, and FP4 are not supported"
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError("MOK does not support overlap_moe_expert_parallel_comm")
+            if getattr(self, "delay_wgrad_compute", False):
+                raise ValueError("MOK does not support delay_wgrad_compute")
+            if getattr(self, "overlap_dispatch_backward_with_experts_wgrad", False):
+                raise ValueError("MOK does not support overlap_dispatch_backward_with_experts_wgrad")
+            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
+                raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
+            if self.moe_shared_expert_intermediate_size is None:
+                raise ValueError("MOK requires a shared expert")
+            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
+            if getattr(self, "moe_latent_size", None) is not None:
+                raise ValueError("MOK does not support latent MoE")
+            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+                raise ValueError("MOK does not support recompute_modules=['shared_experts']")
+            if getattr(self, "log_moe_overload_factor", False):
+                raise ValueError("MOK does not support log_moe_overload_factor")
+            if not self.gated_linear_unit or self.activation_func != F.silu:
+                raise ValueError("MOK currently requires SwiGLU")
+            if self.cuda_graph_impl in ("local", "transformer_engine"):
+                # EXPERIMENT (MCORE_MOK_ALLOW_CHUNK_GRAPH=1): chunk-granularity graphs capture the
+                # whole decoder chunk incl. MoE, like the full-iteration capture MOK supports;
+                # TE's per-microbatch capture protocol vs MOK is untested -> default keeps the error.
+                allow_chunk = (
+                    getattr(self, "cuda_graph_granularity", "layer") == "chunk"
+                    and os.environ.get("MCORE_MOK_ALLOW_CHUNK_GRAPH", "0") == "1"
+                )
+                if not self.cuda_graph_modules and not allow_chunk:
+                    raise ValueError(
+                        "MOK does not support per-layer whole-layer CUDA Graph capture"
+                    )
+                if any(
+                    scope in self.cuda_graph_modules
+                    for scope in (
+                        CudaGraphModule.moe,
+                        CudaGraphModule.moe_router,
+                        CudaGraphModule.moe_preprocess,
+                    )
+                ):
+                    raise ValueError(
+                        "MOK does not support per-layer CUDA Graph scopes containing "
+                        "moe/moe_router/moe_preprocess"
+                    )
+            elif self.cuda_graph_impl not in ("none", "full_iteration"):
+                raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
 
         # mHC selective recompute couples with CUDA graphs only through the guarded
         # attention-only Transformer Engine split. This gate must stay below the

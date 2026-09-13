@@ -7,6 +7,9 @@ try:
     import cuda.bindings.driver as cuda  # type: ignore
     import cutlass
     import cutlass.cute as cute
+    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
+        # CUTLASS DSL >= 4.3 (e.g. NGC 26.07) renamed make_fragment -> make_rmem_tensor (same signature)
+        cute.make_fragment = cute.make_rmem_tensor  # type: ignore[attr-defined]
     import cutlass.pipeline as pipeline  # type: ignore
     import cutlass.utils as utils  # type: ignore
     import cutlass.utils.blackwell_helpers as sm100_utils  # type: ignore

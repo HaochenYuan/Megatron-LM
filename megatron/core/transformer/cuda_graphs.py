@@ -3243,6 +3243,17 @@ class TECudaGraphHelper:
                 kwargs['_reuse_graph_input_output_buffers'] = (
                     os.environ.get('MCORE_CG_NO_BUFFER_REUSE', '0') != '1'
                 )
+                # With fused gradient accumulation every module parameter's returned grad is a
+                # sentinel (the real wgrad goes to main_grad), so TE must not weak-ref + memcpy-clone
+                # those slots on return (TE >= 2.7 `clone_param_grads_on_return`). Custom fused
+                # ops that return `param.detach()` sentinels (e.g. the MOK megakernel bridge) make
+                # that clone fail on quantized parameters ("CUDA error: invalid argument").
+                if (
+                    self.config.gradient_accumulation_fusion
+                    and 'clone_param_grads_on_return' in inspect.signature(make_graphed_callables).parameters
+                    and os.environ.get('MCORE_CG_CLONE_PARAM_GRADS', '0') != '1'
+                ):
+                    kwargs['clone_param_grads_on_return'] = False
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
